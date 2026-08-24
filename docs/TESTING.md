@@ -20,6 +20,7 @@ DEEPSEEK_API_KEY=... DEEPSEEK_MODEL=deepseek-v4-pro npm run test:live
 ```
 
 Live tests are opt-in and should not run in default CI.
+Without `DEEPSEEK_API_KEY`, the live smoke test exits quickly without making a network request.
 
 ## Test Layers
 

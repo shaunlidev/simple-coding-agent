@@ -5,6 +5,6 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "../../types/**/*.d.ts"],
   "references": [{ "path": "../ai" }, { "path": "../agent" }]
 }

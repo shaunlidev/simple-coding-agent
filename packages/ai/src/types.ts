@@ -53,7 +53,15 @@ export type UserMessage = {
   content: string;
 };
 
-export type Message = UserMessage | AssistantMessage;
+export type ToolMessage = {
+  role: "tool";
+  toolCallId: string;
+  toolName: string;
+  content: string;
+  isError?: boolean;
+};
+
+export type Message = UserMessage | AssistantMessage | ToolMessage;
 
 export type ToolParameterSchema =
   | {
@@ -71,7 +79,7 @@ export type ToolDefinition<TArguments extends JsonObject = JsonObject> = {
   name: string;
   description: string;
   parameters: ToolParameterSchema;
-  execute?: (args: TArguments) => Promise<unknown> | unknown;
+  execute?: (args: TArguments, signal?: AbortSignal) => Promise<unknown> | unknown;
 };
 
 export type Model = {

@@ -1,5 +1,7 @@
 export type { AssistantMessageEventStream } from "./assistant-message-event-stream.js";
 export { createAssistantMessageEventStream } from "./assistant-message-event-stream.js";
+export type { DeepSeekProviderOptions } from "./deepseek-provider.js";
+export { createDeepSeekProvider } from "./deepseek-provider.js";
 export { EventStream, type EventStreamOptions } from "./event-stream.js";
 export type { FauxProviderHandle, FauxProviderOptions, FauxResponse } from "./faux-provider.js";
 export { createFauxProvider } from "./faux-provider.js";
@@ -23,6 +25,7 @@ export type {
   ToolDefinition,
   ToolParameterSchema,
   ToolCallContent,
+  ToolMessage,
   Usage,
   UserMessage,
 } from "./types.js";
