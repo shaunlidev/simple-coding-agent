@@ -235,9 +235,10 @@ export async function createDefaultRuntime(command: Extract<CliCommand, { kind: 
     createDeepSeekProvider(options: {
       model?: string;
       thinking?: boolean;
+      stream?: boolean;
     }): { models: readonly unknown[] };
   };
-  const provider = createDeepSeekProvider({ model: command.model, thinking: command.thinking });
+  const provider = createDeepSeekProvider({ model: command.model, thinking: command.thinking, stream: true });
   return new Agent({
     provider,
     model: provider.models[0],

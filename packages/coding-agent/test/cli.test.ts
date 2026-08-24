@@ -12,6 +12,14 @@ async function createRoot(): Promise<string> {
   return await mkdtemp(join(tmpdir(), "coding-agent-cli-"));
 }
 
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return { promise, resolve };
+}
+
 test("parseCliArgs supports static commands and run modes", () => {
   assert.deepEqual(parseCliArgs(["--help"]), { kind: "help" });
   assert.deepEqual(parseCliArgs(["-v"]), { kind: "version" });
@@ -258,5 +266,66 @@ test("session redaction refuses to serialize the active DeepSeek key", async () 
     assert.equal(output.stderr.includes("live-secret"), false);
   } finally {
     process.env.DEEPSEEK_API_KEY = previous;
+  }
+});
+
+test("default runtime requests DeepSeek streaming and emits deltas before body completion", async () => {
+  const { createDefaultRuntime } = await import("../src/cli.ts");
+  const encoder = new TextEncoder();
+  const secondChunk = deferred();
+  const previousKey = process.env.DEEPSEEK_API_KEY;
+  const previousFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | undefined;
+  let waitingForSecondChunk = false;
+
+  process.env.DEEPSEEK_API_KEY = "test-key";
+  globalThis.fetch = async (_url, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`));
+        },
+        async pull(controller) {
+          if (waitingForSecondChunk) return;
+          waitingForSecondChunk = true;
+          await secondChunk.promise;
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "!" }, finish_reason: "stop" }] })}\n\n`),
+          );
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  };
+
+  try {
+    const runner = await createDefaultRuntime({ kind: "run", mode: "json", prompt: "hello" });
+    const seen: string[] = [];
+    const unsubscribe = runner.subscribe?.((event) => {
+      if (event.type === "provider_event" && event.event.type === "text_delta") {
+        seen.push(event.event.delta);
+      }
+    });
+    const promptPromise = runner.prompt("hello");
+
+    while (seen.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    assert.equal(requestBody?.stream, true);
+    assert.deepEqual(seen, ["hi"]);
+    assert.equal(waitingForSecondChunk, true);
+
+    secondChunk.resolve();
+    const message = await promptPromise;
+    unsubscribe?.();
+
+    assert.deepEqual(message.content, [{ type: "text", text: "hi!" }]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    process.env.DEEPSEEK_API_KEY = previousKey;
   }
 });
