@@ -409,13 +409,14 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): P
 
       queueMicrotask(() => {
         void (async () => {
+          const toolChoice = context.messages.some((message) => message.role === "tool") ? undefined : options.toolChoice;
           const body = {
             model: model.id,
             messages: toChatMessages(context),
             tools: toDeepSeekTools(context.tools),
             stream: options.stream === true,
             ...(options.thinking === true ? {} : { thinking: { type: "disabled" } }),
-            ...(options.toolChoice ? { tool_choice: options.toolChoice } : {}),
+            ...(toolChoice ? { tool_choice: toolChoice } : {}),
           };
           const response = await doFetch(`${baseUrl}/chat/completions`, {
             method: "POST",

@@ -191,6 +191,42 @@ test("request body can require tool choice and enable thinking", async () => {
   assert.equal("thinking" in (requestBody as Record<string, unknown>), false);
 });
 
+test("required tool choice is not repeated after tool results", async () => {
+  let requestBody: unknown;
+  const provider = createDeepSeekProvider({
+    apiKey: "test-key",
+    toolChoice: "required",
+    fetch: async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body));
+      return jsonResponse({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] });
+    },
+  });
+
+  const stream = provider.stream(provider.models[0], {
+    messages: [
+      { role: "user", content: "read" },
+      {
+        role: "assistant",
+        stopReason: "tool_call",
+        content: [{ type: "tool_call", id: "call-1", name: "read", arguments: { path: "fixture.txt" } }],
+      },
+      { role: "tool", toolCallId: "call-1", toolName: "read", content: "contents" },
+    ],
+    tools: [
+      {
+        name: "read",
+        description: "Read a file",
+        parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
+      },
+    ],
+  });
+  for await (const _ of stream) {
+    // drain
+  }
+
+  assert.equal("tool_choice" in (requestBody as Record<string, unknown>), false);
+});
+
 test("streaming SSE chunks emit text and tool deltas", async () => {
   const provider = createDeepSeekProvider({
     apiKey: "test-key",
