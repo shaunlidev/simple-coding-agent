@@ -1,0 +1,19 @@
+{
+  "name": "@simple-coding-agent/coding-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "simple-agent": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-transform-types --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@simple-coding-agent/agent": "0.1.0",
+    "@simple-coding-agent/ai": "0.1.0"
+  }
+}

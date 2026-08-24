@@ -1,0 +1,13 @@
+{
+  "name": "@simple-coding-agent/ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p ../../tsconfig.json",
+    "test": "node --experimental-transform-types --test \"test/*.test.ts\""
+  }
+}

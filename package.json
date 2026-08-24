@@ -1,0 +1,20 @@
+{
+  "name": "simple-coding-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b packages/ai packages/agent packages/coding-agent packages/tui",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test \"packages/**/*.test.ts\" \"evals/**/*.eval.ts\"",
+    "test:ai": "node --experimental-transform-types --test \"packages/ai/test/*.test.ts\"",
+    "eval": "node --experimental-transform-types --test \"evals/*.eval.ts\"",
+    "test:live": "node --experimental-transform-types --test \"evals/*.live.eval.ts\""
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
