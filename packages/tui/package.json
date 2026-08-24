@@ -5,8 +5,14 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "simple-coding-agent-tui": "dist/entry.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --experimental-transform-types --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@simple-coding-agent/coding-agent": "0.1.0"
   }
 }

@@ -7,12 +7,17 @@
     "packages/*"
   ],
   "scripts": {
+    "agent": "node packages/coding-agent/dist/entry.js",
+    "agent:help": "node packages/coding-agent/dist/entry.js --help",
     "build": "tsc -b packages/ai packages/agent packages/coding-agent packages/tui",
+    "check:package-boundaries": "node scripts/check-package-boundaries.mjs",
     "check": "tsc --noEmit",
     "test": "node --experimental-transform-types --test \"packages/**/*.test.ts\" \"evals/**/*.eval.ts\"",
     "test:ai": "node --experimental-transform-types --test \"packages/ai/test/*.test.ts\"",
     "eval": "node --experimental-transform-types --test \"evals/*.eval.ts\"",
-    "test:live": "node --experimental-transform-types --test \"evals/*.live.eval.ts\""
+    "test:live": "node --experimental-transform-types --test \"evals/*.live.eval.ts\"",
+    "tui": "node packages/tui/dist/entry.js",
+    "tui:help": "node packages/tui/dist/entry.js --help"
   },
   "engines": {
     "node": ">=22.19.0"

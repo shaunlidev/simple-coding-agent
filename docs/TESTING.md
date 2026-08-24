@@ -5,6 +5,7 @@
 ```bash
 npm run check
 npm run build
+npm run check:package-boundaries
 npm run test
 npm run eval
 ```
@@ -30,4 +31,5 @@ With a key, the live gate verifies both plain text completion and a required too
 - Agent harness tests assert transcripts, event order, tool calls, and final output.
 - CLI process tests assert stdout, stderr, and exit codes across the real process boundary.
 - Session tests assert JSONL versioning, append/read ordering, replay, and future-version rejection.
-- Evals assert task-level behavior and keep replayable artifacts.
+- TUI tests assert rendered terminal status, tool events, abort handling, and session records.
+- Evals assert task-level behavior and record prompt, transcript, tool events, final output, and workspace path.

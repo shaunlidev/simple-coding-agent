@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { bashTool, editTool, readTool, writeTool } from "../src/tools.ts";
+import { bashTool, editTool, readTool, scrubToolEnvironment, writeTool } from "../src/tools.ts";
 
 async function createRoot(): Promise<string> {
   return await mkdtemp(join(tmpdir(), "simple-agent-tools-"));
@@ -123,6 +123,50 @@ test("bash returns stdout, stderr, exit code, and timeout info", async () => {
   assert.equal(result.stderr, "err\n");
   assert.equal(result.exitCode, 3);
   assert.equal(result.timedOut, false);
+});
+
+test("bash scrubs API keys and keeps ordinary execution working", async () => {
+  const root = await createRoot();
+
+  const result = await bashTool(
+    {
+      command: process.execPath,
+      args: ["-e", "console.log(process.env.DEEPSEEK_API_KEY || 'missing'); console.log(Boolean(process.env.PATH))"],
+    },
+    {
+      allowedRoot: root,
+      env: {
+        PATH: process.env.PATH,
+        DEEPSEEK_API_KEY: "secret-value",
+        OTHER_TOKEN: "token-value",
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "missing\ntrue\n");
+});
+
+test("scrubToolEnvironment keeps safe names and drops common secret names", () => {
+  assert.deepEqual(
+    scrubToolEnvironment({
+      PATH: "/bin",
+      HOME: "/tmp/home",
+      DEEPSEEK_API_KEY: "secret",
+      SERVICE_TOKEN: "secret",
+      DATABASE_PASSWORD: "secret",
+      NORMAL_VALUE: "hidden by default",
+    }),
+    { PATH: "/bin", HOME: "/tmp/home" },
+  );
+});
+
+test("gitignore ignores local env files while allowing the example", async () => {
+  const text = new TextDecoder().decode(await readFile(".gitignore"));
+
+  assert.equal(text.includes(".env\n"), true);
+  assert.equal(text.includes(".env.*\n"), true);
+  assert.equal(text.includes("!.env.example\n"), true);
 });
 
 test("tools honor cancellation before async work", async () => {

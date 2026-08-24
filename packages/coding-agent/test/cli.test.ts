@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { Agent } from "../../agent/src/index.ts";
 import { createFauxProvider } from "../../ai/dist/faux-provider.js";
 import { parseCliArgs, runCli } from "../src/cli.ts";
+import { SESSION_RECORD_VERSION } from "../src/session.ts";
+
+async function createRoot(): Promise<string> {
+  return await mkdtemp(join(tmpdir(), "coding-agent-cli-"));
+}
 
 test("parseCliArgs supports static commands and run modes", () => {
   assert.deepEqual(parseCliArgs(["--help"]), { kind: "help" });
@@ -14,6 +22,8 @@ test("parseCliArgs supports static commands and run modes", () => {
     cwd: undefined,
     model: undefined,
     thinking: false,
+    sessionPath: undefined,
+    resumePath: undefined,
   });
   assert.throws(() => parseCliArgs(["--wat"]), /Unknown option: --wat/);
   assert.throws(() => parseCliArgs([]), /A prompt is required/);
@@ -117,4 +127,136 @@ test("json mode emits one versioned JSON object per agent event", async () => {
   assert.deepEqual(lines.map((line) => line.version).every((version) => version === 1), true);
   assert.equal(lines[0].event.type, "agent_start");
   assert.equal(lines.at(-1).event.type, "agent_end");
+});
+
+test("session flag writes versioned prompt, events, and final message records", async () => {
+  const root = await createRoot();
+  const sessionPath = join(root, "session.jsonl");
+  const output = { stdout: "", stderr: "" };
+  const listeners = new Set<(event: { type: "agent_start"; prompt: string } | { type: "agent_end"; messages: [] }) => void | Promise<void>>();
+
+  const code = await runCli(
+    ["--session", sessionPath, "hello"],
+    {
+      stdout: { write: (chunk: string) => (output.stdout += chunk) },
+      stderr: { write: (chunk: string) => (output.stderr += chunk) },
+    },
+    () => ({
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      async prompt(prompt) {
+        for (const listener of listeners) await listener({ type: "agent_start", prompt });
+        for (const listener of listeners) await listener({ type: "agent_end", messages: [] });
+        return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] };
+      },
+    }),
+  );
+
+  const records = new TextDecoder()
+    .decode(await readFile(sessionPath))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+
+  assert.equal(code, 0);
+  assert.deepEqual(records.map((record) => record.version), [
+    SESSION_RECORD_VERSION,
+    SESSION_RECORD_VERSION,
+    SESSION_RECORD_VERSION,
+    SESSION_RECORD_VERSION,
+  ]);
+  assert.deepEqual(records.map((record) => record.type), ["message", "event", "event", "message"]);
+});
+
+test("resume flag replays session messages before runtime creation", async () => {
+  const root = await createRoot();
+  const sessionPath = join(root, "session.jsonl");
+  await writeFile(
+    sessionPath,
+    [
+      JSON.stringify({ version: 1, type: "message", message: { role: "user", content: "earlier" } }),
+      JSON.stringify({
+        version: 1,
+        type: "message",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "seen" }] },
+      }),
+      "",
+    ].join("\n"),
+  );
+
+  let initialCount = 0;
+  const code = await runCli(
+    ["--resume", sessionPath, "next"],
+    {
+      stdout: { write() {} },
+      stderr: { write() {} },
+    },
+    (command) => {
+      initialCount = command.initialMessages?.length ?? 0;
+      return {
+        async prompt() {
+          return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] };
+        },
+      };
+    },
+  );
+
+  assert.equal(code, 0);
+  assert.equal(initialCount, 2);
+});
+
+test("future-version resume file fails before provider initialization", async () => {
+  const root = await createRoot();
+  const sessionPath = join(root, "future.jsonl");
+  const output = { stdout: "", stderr: "" };
+  let initialized = false;
+  await writeFile(sessionPath, `${JSON.stringify({ version: 999, type: "message", message: { role: "user", content: "x" } })}\n`);
+
+  const code = await runCli(
+    ["--resume", sessionPath, "next"],
+    {
+      stdout: { write: (chunk: string) => (output.stdout += chunk) },
+      stderr: { write: (chunk: string) => (output.stderr += chunk) },
+    },
+    () => {
+      initialized = true;
+      throw new Error("should not initialize");
+    },
+  );
+
+  assert.equal(code, 1);
+  assert.equal(initialized, false);
+  assert.equal(output.stdout, "");
+  assert.equal(output.stderr, "Unsupported session record version: 999\n");
+});
+
+test("session redaction refuses to serialize the active DeepSeek key", async () => {
+  const root = await createRoot();
+  const sessionPath = join(root, "session.jsonl");
+  const previous = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "live-secret";
+
+  try {
+    const output = { stdout: "", stderr: "" };
+    const code = await runCli(
+      ["--session", sessionPath, "hello"],
+      {
+        stdout: { write: (chunk: string) => (output.stdout += chunk) },
+        stderr: { write: (chunk: string) => (output.stderr += chunk) },
+      },
+      () => ({
+        async prompt() {
+          return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "live-secret" }] };
+        },
+      }),
+    );
+
+    assert.equal(code, 1);
+    assert.equal(output.stdout, "");
+    assert.equal(output.stderr.includes("live-secret"), false);
+  } finally {
+    process.env.DEEPSEEK_API_KEY = previous;
+  }
 });

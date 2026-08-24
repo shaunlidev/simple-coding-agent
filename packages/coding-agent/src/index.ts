@@ -3,6 +3,7 @@ export {
   createDefaultRuntime,
   parseCliArgs,
   runCli,
+  VERSION,
   type CliCommand,
   type CliIo,
   type CliMode,

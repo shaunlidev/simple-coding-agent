@@ -7,6 +7,7 @@ export type ToolRuntimeOptions = {
   allowedRoot: string;
   maxReadBytes?: number;
   commandTimeoutMs?: number;
+  env?: Record<string, string | undefined>;
 };
 
 export type ReadArgs = {
@@ -43,6 +44,17 @@ export type BashResult = {
 
 const DEFAULT_MAX_READ_BYTES = 64 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
+const SAFE_ENV_NAMES = new Set(["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM"]);
+const BLOCKED_ENV_NAMES = new Set([
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AZURE_CLIENT_SECRET",
+  "DEEPSEEK_API_KEY",
+  "GCP_SERVICE_ACCOUNT_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "OPENAI_API_KEY",
+]);
 
 function assertNotAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
@@ -86,6 +98,28 @@ function rejectBinary(bytes: Uint8Array): void {
   if (Buffer.from(bytes).includes(0)) {
     throw new Error("Refusing to read obvious binary file");
   }
+}
+
+function isSensitiveEnvName(name: string): boolean {
+  return (
+    BLOCKED_ENV_NAMES.has(name) ||
+    name.endsWith("_API_KEY") ||
+    name.endsWith("_TOKEN") ||
+    name.endsWith("_SECRET") ||
+    name.endsWith("_PASSWORD") ||
+    name.endsWith("_CREDENTIALS")
+  );
+}
+
+export function scrubToolEnvironment(source: Record<string, string | undefined> = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    if (!SAFE_ENV_NAMES.has(name)) continue;
+    if (isSensitiveEnvName(name)) continue;
+    env[name] = value;
+  }
+  return env;
 }
 
 function splitLines(value: string): string[] {
@@ -184,6 +218,7 @@ export async function bashTool(args: BashArgs, runtime: ToolRuntimeOptions, sign
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const child = spawn(args.command, args.args ?? [], {
     cwd: await realpath(runtime.allowedRoot),
+    env: scrubToolEnvironment(runtime.env ?? process.env),
     shell: false,
     signal: controller.signal,
   });

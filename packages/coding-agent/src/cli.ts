@@ -1,5 +1,11 @@
 import type { AgentEvent } from "../../agent/dist/index.js";
-import type { AssistantContent, AssistantMessage } from "../../ai/dist/index.js";
+import type { AssistantContent, AssistantMessage, Message } from "../../ai/dist/index.js";
+import {
+  appendSessionRecord,
+  readSessionRecords,
+  replaySessionMessages,
+  SESSION_RECORD_VERSION,
+} from "./session.js";
 import { createLocalTools } from "./tools.js";
 
 export type CliMode = "print" | "json";
@@ -14,6 +20,9 @@ export type CliCommand =
       cwd?: string;
       model?: string;
       thinking?: boolean;
+      sessionPath?: string;
+      resumePath?: string;
+      initialMessages?: readonly Message[];
     };
 
 export class CliUsageError extends Error {
@@ -29,7 +38,7 @@ export type CliIo = {
 };
 
 export type PromptRunner = {
-  prompt(prompt: string): Promise<AssistantMessage>;
+  prompt(prompt: string, options?: { signal?: AbortSignal }): Promise<AssistantMessage>;
   subscribe?(listener: (event: AgentEvent) => void | Promise<void>): () => void;
 };
 
@@ -37,7 +46,7 @@ export type CliRuntimeFactory = (command: Extract<CliCommand, { kind: "run" }>) 
 
 export const VERSION = "0.1.0";
 
-const USAGE = `Usage: simple-coding-agent [--print|--json|--mode json] [--cwd PATH] [--model MODEL] [--thinking] <prompt>
+const USAGE = `Usage: simple-coding-agent [--print|--json|--mode json] [--cwd PATH] [--model MODEL] [--thinking] [--session PATH] [--resume PATH] <prompt>
 
 Options:
   --help           Show help
@@ -45,6 +54,11 @@ Options:
   --print          Print final assistant text
   --json           Emit JSONL agent events
   --mode MODE      Use print or json mode
+  --cwd PATH       Limit local tools to a working directory
+  --model MODEL    DeepSeek model id
+  --thinking       Allow provider thinking when supported
+  --session PATH   Append versioned JSONL session records
+  --resume PATH    Replay message records from a session JSONL file
 `;
 
 export function parseCliArgs(argv: readonly string[]): CliCommand {
@@ -53,6 +67,8 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   let cwd: string | undefined;
   let model: string | undefined;
   let thinking = false;
+  let sessionPath: string | undefined;
+  let resumePath: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -70,12 +86,14 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
       thinking = true;
       continue;
     }
-    if (arg === "--cwd" || arg === "--model" || arg === "--mode") {
+    if (arg === "--cwd" || arg === "--model" || arg === "--mode" || arg === "--session" || arg === "--resume") {
       const value = argv[index + 1];
       if (!value) throw new CliUsageError(`${arg} requires a value`);
       index += 1;
       if (arg === "--cwd") cwd = value;
       if (arg === "--model") model = value;
+      if (arg === "--session") sessionPath = value;
+      if (arg === "--resume") resumePath = value;
       if (arg === "--mode") {
         if (value !== "print" && value !== "json") {
           throw new CliUsageError(`Unknown mode: ${value}`);
@@ -95,7 +113,7 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     throw new CliUsageError("A prompt is required.");
   }
 
-  return { kind: "run", mode, prompt, cwd, model, thinking };
+  return { kind: "run", mode, prompt, cwd, model, thinking, sessionPath, resumePath };
 }
 
 function assistantText(message: AssistantMessage): string {
@@ -111,6 +129,28 @@ function normalizeError(error: unknown): string {
 
 function writeJsonLine(io: CliIo, event: AgentEvent): void {
   io.stdout.write(`${JSON.stringify({ version: 1, event })}\n`);
+}
+
+function hasSecret(value: string): boolean {
+  return Boolean(process.env.DEEPSEEK_API_KEY && value.includes(process.env.DEEPSEEK_API_KEY));
+}
+
+async function appendSafeSessionMessage(path: string | undefined, message: Message): Promise<void> {
+  if (!path) return;
+  const serialized = JSON.stringify(message);
+  if (hasSecret(serialized)) {
+    throw new Error("Refusing to write session record containing DEEPSEEK_API_KEY");
+  }
+  await appendSessionRecord(path, { version: SESSION_RECORD_VERSION, type: "message", message });
+}
+
+async function appendSafeSessionEvent(path: string | undefined, event: AgentEvent): Promise<void> {
+  if (!path) return;
+  const serialized = JSON.stringify(event);
+  if (hasSecret(serialized)) {
+    throw new Error("Refusing to write session event containing DEEPSEEK_API_KEY");
+  }
+  await appendSessionRecord(path, { version: SESSION_RECORD_VERSION, type: "event", event });
 }
 
 export async function runCli(
@@ -135,12 +175,22 @@ export async function runCli(
     return 0;
   }
 
+  const runCommand = command;
   try {
-    const runner = await createRuntime(command);
-    if (command.mode === "json") {
-      const unsubscribe = runner.subscribe?.((event) => writeJsonLine(io, event));
+    const initialMessages = runCommand.resumePath
+      ? replaySessionMessages(await readSessionRecords(runCommand.resumePath))
+      : undefined;
+    const hydratedCommand = { ...runCommand, initialMessages };
+    await appendSafeSessionMessage(hydratedCommand.sessionPath, { role: "user", content: hydratedCommand.prompt });
+    const runner = await createRuntime(hydratedCommand);
+    if (hydratedCommand.mode === "json") {
+      const unsubscribe = runner.subscribe?.((event) => {
+        writeJsonLine(io, event);
+        return appendSafeSessionEvent(hydratedCommand.sessionPath, event);
+      });
       try {
-        const message = await runner.prompt(command.prompt);
+        const message = await runner.prompt(hydratedCommand.prompt);
+        await appendSafeSessionMessage(hydratedCommand.sessionPath, message);
         if (message.stopReason === "error" || message.stopReason === "aborted") {
           io.stderr.write(`${message.errorMessage ?? (assistantText(message) || "Agent failed")}\n`);
           return 1;
@@ -151,7 +201,14 @@ export async function runCli(
       }
     }
 
-    const message = await runner.prompt(command.prompt);
+    const unsubscribe = runner.subscribe?.((event) => appendSafeSessionEvent(hydratedCommand.sessionPath, event));
+    let message: AssistantMessage;
+    try {
+      message = await runner.prompt(hydratedCommand.prompt);
+    } finally {
+      unsubscribe?.();
+    }
+    await appendSafeSessionMessage(hydratedCommand.sessionPath, message);
     if (message.stopReason === "error" || message.stopReason === "aborted") {
       io.stderr.write(`${message.errorMessage ?? (assistantText(message) || "Agent failed")}\n`);
       return 1;
@@ -185,5 +242,6 @@ export async function createDefaultRuntime(command: Extract<CliCommand, { kind: 
     provider,
     model: provider.models[0],
     tools: createLocalTools({ allowedRoot: command.cwd ?? process.cwd() }),
+    messages: command.initialMessages ?? [],
   });
 }

@@ -1,30 +1,9 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import test from "node:test";
+import { runNodeEntry } from "./process-harness.ts";
 
 function runEntry(args: readonly string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  const child = spawn(
-    process.execPath,
-    ["--disable-warning=ExperimentalWarning", "--experimental-transform-types", "packages/coding-agent/src/entry.ts", ...args],
-    {
-      cwd: process.cwd(),
-      env: { ...process.env, DEEPSEEK_API_KEY: "" },
-    },
-  );
-  const stdout: Uint8Array[] = [];
-  const stderr: Uint8Array[] = [];
-  child.stdout.on("data", (chunk) => stdout.push(chunk));
-  child.stderr.on("data", (chunk) => stderr.push(chunk));
-
-  return new Promise((resolve) => {
-    child.on("close", (code) => {
-      resolve({
-        code,
-        stdout: Buffer.from(new Uint8Array(stdout.flatMap((chunk) => [...chunk]))).toString("utf8"),
-        stderr: Buffer.from(new Uint8Array(stderr.flatMap((chunk) => [...chunk]))).toString("utf8"),
-      });
-    });
-  });
+  return runNodeEntry("packages/coding-agent/src/entry.ts", args, { DEEPSEEK_API_KEY: "" });
 }
 
 test("real entry handles help and version", async () => {
