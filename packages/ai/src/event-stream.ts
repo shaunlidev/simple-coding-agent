@@ -1,4 +1,5 @@
 export type EventStreamOptions<TEvent, TResult> = {
+  validate?: (event: TEvent) => void;
   isTerminal: (event: TEvent) => boolean;
   getResult: (event: TEvent) => TResult;
 };
@@ -16,6 +17,7 @@ function normalizeError(error: unknown): Error {
 export class EventStream<TEvent, TResult = TEvent> implements AsyncIterable<TEvent> {
   readonly #isTerminal: (event: TEvent) => boolean;
   readonly #getResult: (event: TEvent) => TResult;
+  readonly #validate: ((event: TEvent) => void) | undefined;
   readonly #queue: TEvent[] = [];
   readonly #waiters: Waiter<TEvent>[] = [];
   readonly #finalResult: Promise<TResult>;
@@ -28,6 +30,7 @@ export class EventStream<TEvent, TResult = TEvent> implements AsyncIterable<TEve
   constructor(options: EventStreamOptions<TEvent, TResult>) {
     this.#isTerminal = options.isTerminal;
     this.#getResult = options.getResult;
+    this.#validate = options.validate;
     this.#finalResult = new Promise<TResult>((resolve, reject) => {
       this.#resolveFinalResult = resolve;
       this.#rejectFinalResult = reject;
@@ -37,9 +40,17 @@ export class EventStream<TEvent, TResult = TEvent> implements AsyncIterable<TEve
   push(event: TEvent): void {
     this.#assertCanPush();
 
-    if (this.#isTerminal(event)) {
-      this.#terminal = true;
-      this.#resolveFinalResult(this.#getResult(event));
+    try {
+      this.#validate?.(event);
+
+      if (this.#isTerminal(event)) {
+        this.#terminal = true;
+        this.#resolveFinalResult(this.#getResult(event));
+      }
+    } catch (cause) {
+      const error = normalizeError(cause);
+      this.fail(error);
+      throw error;
     }
 
     const waiter = this.#waiters.shift();

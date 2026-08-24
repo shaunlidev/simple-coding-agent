@@ -8,7 +8,7 @@ Build the minimal agent described in `../../ARCHITECTURE.md`, with local determi
 
 - [x] Phase 0: repository knowledge map and monorepo scaffold
 - [x] Phase 1: EventStream
-- [ ] Phase 2: provider event validator
+- [x] Phase 2: provider event validator
 - [ ] Phase 3: tool argument validation and Faux Provider
 - [ ] Phase 4: Agent loop and Agent class
 - [ ] Phase 5: local tools
@@ -20,6 +20,8 @@ Build the minimal agent described in `../../ARCHITECTURE.md`, with local determi
 - Use Node native test runner for early phases to avoid dependency installation.
 - Keep DeepSeek out of the default test path.
 - Use repository-local docs as the system of record.
+- Provider stream events are validated as an ordered sequence before they are yielded to consumers.
+- Tool-call argument deltas are accumulated as JSON text and parsed only at `tool_call_end`.
 
 ## Acceptance Gates
 
