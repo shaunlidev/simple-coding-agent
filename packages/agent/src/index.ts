@@ -1,4 +1,4 @@
-import { EventStream, parseToolArguments, ToolArgumentsValidationError } from "../../ai/src/index.js";
+import { EventStream, parseToolArguments, ToolArgumentsValidationError } from "../../ai/dist/index.js";
 import type {
   AssistantContent,
   AssistantMessage,
@@ -9,7 +9,7 @@ import type {
   ToolCallContent,
   ToolDefinition,
   ToolMessage,
-} from "../../ai/src/index.js";
+} from "../../ai/dist/index.js";
 
 export type AgentEvent =
   | { type: "agent_start"; prompt: string }
@@ -52,6 +52,10 @@ function assertNotAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new Error("Operation aborted");
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || error.message === "Operation aborted");
 }
 
 function createAgentLoopStream(): AgentLoopEventStream {
@@ -107,7 +111,11 @@ async function produceAgentLoop(
   stream.push({ type: "agent_start", prompt });
 
   for (let turn = 1; turn <= maxTurns; turn += 1) {
-    assertNotAborted(options.signal);
+    if (options.signal?.aborted) {
+      messages.push(createAgentErrorMessage(new Error("Operation aborted"), "aborted"));
+      stream.push({ type: "agent_end", messages: cloneMessages(messages) });
+      return;
+    }
     stream.push({ type: "turn_start", turn, messages: cloneMessages(messages) });
 
     const context: ProviderContext = {
@@ -126,8 +134,16 @@ async function produceAgentLoop(
       return;
     }
 
-    for await (const event of providerStream) {
-      stream.push({ type: "provider_event", turn, event });
+    try {
+      for await (const event of providerStream) {
+        stream.push({ type: "provider_event", turn, event });
+      }
+    } catch (error) {
+      await providerStream.result().catch(() => undefined);
+      const message = createAgentErrorMessage(error, isAbortError(error) ? "aborted" : "error");
+      messages.push(message);
+      stream.push({ type: "agent_end", messages: cloneMessages(messages) });
+      return;
     }
 
     const assistant = await providerStream.result();
@@ -148,7 +164,11 @@ async function produceAgentLoop(
     }
 
     for (const toolCall of toolCalls) {
-      assertNotAborted(options.signal);
+      if (options.signal?.aborted) {
+        messages.push(createAgentErrorMessage(new Error("Operation aborted"), "aborted"));
+        stream.push({ type: "agent_end", messages: cloneMessages(messages) });
+        return;
+      }
       const tool = tools.get(toolCall.name);
       if (!tool) {
         throw new Error(`Unknown tool "${toolCall.name}"`);
@@ -184,11 +204,11 @@ async function produceAgentLoop(
   throw new Error(`Agent loop exceeded maxTurns ${maxTurns}`);
 }
 
-function createAgentErrorMessage(error: unknown): AssistantMessage {
+function createAgentErrorMessage(error: unknown, stopReason: "error" | "aborted" = "error"): AssistantMessage {
   return {
     role: "assistant",
     content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-    stopReason: "error",
+    stopReason,
     errorMessage: error instanceof Error ? error.message : String(error),
   };
 }

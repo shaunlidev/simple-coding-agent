@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import type { ToolDefinition } from "../../ai/src/index.js";
+import type { ToolDefinition } from "../../ai/dist/index.js";
 
 export type ToolRuntimeOptions = {
   allowedRoot: string;
@@ -54,13 +54,32 @@ async function resolveInsideRoot(root: string, requestedPath: string, options: {
   const rootReal = await realpath(root);
   const absolute = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(rootReal, requestedPath);
   const targetReal = options.mustExist ? await realpath(absolute) : resolve(absolute);
-  const relation = relative(rootReal, targetReal);
-
-  if (relation === "" || (!relation.startsWith("..") && !isAbsolute(relation))) {
+  if (isInsideRoot(rootReal, targetReal)) {
     return targetReal;
   }
 
   throw new Error(`Path escapes allowed root: ${requestedPath}`);
+}
+
+function isInsideRoot(rootReal: string, targetReal: string): boolean {
+  const relation = relative(rootReal, targetReal);
+  return relation === "" || (!relation.startsWith("..") && !isAbsolute(relation));
+}
+
+async function resolveWritableInsideRoot(root: string, requestedPath: string): Promise<string> {
+  const rootReal = await realpath(root);
+  const absolute = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(rootReal, requestedPath);
+  if (!isInsideRoot(rootReal, absolute)) {
+    throw new Error(`Path escapes allowed root: ${requestedPath}`);
+  }
+
+  await mkdir(dirname(absolute), { recursive: true });
+  const parentReal = await realpath(dirname(absolute));
+  if (!isInsideRoot(rootReal, parentReal)) {
+    throw new Error(`Path escapes allowed root: ${requestedPath}`);
+  }
+
+  return resolve(parentReal, absolute.slice(dirname(absolute).length + 1));
 }
 
 function rejectBinary(bytes: Uint8Array): void {
@@ -131,8 +150,7 @@ export async function readTool(args: ReadArgs, runtime: ToolRuntimeOptions, sign
 
 export async function writeTool(args: WriteArgs, runtime: ToolRuntimeOptions, signal?: AbortSignal): Promise<string> {
   assertNotAborted(signal);
-  const target = await resolveInsideRoot(runtime.allowedRoot, args.path, { mustExist: false });
-  await mkdir(dirname(target), { recursive: true });
+  const target = await resolveWritableInsideRoot(runtime.allowedRoot, args.path);
   await writeFile(target, args.content);
   return `Wrote ${args.path}`;
 }

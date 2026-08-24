@@ -29,7 +29,7 @@ export type ToolCallContent = {
 
 export type AssistantContent = TextContent | ThinkingContent | ToolCallContent;
 
-export type AssistantStopReason = "stop" | "tool_call" | "error";
+export type AssistantStopReason = "stop" | "tool_call" | "error" | "aborted";
 
 export type Usage = {
   input: number;

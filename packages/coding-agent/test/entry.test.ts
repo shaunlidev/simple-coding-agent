@@ -3,9 +3,14 @@ import { spawn } from "node:child_process";
 import test from "node:test";
 
 function runEntry(args: readonly string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  const child = spawn(process.execPath, ["packages/coding-agent/dist/entry.js", ...args], {
-    cwd: process.cwd(),
-  });
+  const child = spawn(
+    process.execPath,
+    ["--disable-warning=ExperimentalWarning", "--experimental-transform-types", "packages/coding-agent/src/entry.ts", ...args],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, DEEPSEEK_API_KEY: "" },
+    },
+  );
   const stdout: Uint8Array[] = [];
   const stderr: Uint8Array[] = [];
   child.stdout.on("data", (chunk) => stdout.push(chunk));
@@ -27,16 +32,17 @@ test("real entry handles help and version", async () => {
   assert.equal((await runEntry(["--version"])).stdout, "0.1.0\n");
 });
 
-test("real entry handles print and json modes", async () => {
+test("real entry requires DeepSeek configuration for runtime modes", async () => {
   const print = await runEntry(["--print", "hello"]);
   const json = await runEntry(["--mode", "json", "hello"]);
 
-  assert.equal(print.code, 0);
-  assert.equal(print.stdout, "Echo: hello\n");
-  assert.equal(print.stderr, "");
+  assert.equal(print.code, 1);
+  assert.equal(print.stdout, "");
+  assert.equal(print.stderr, "DEEPSEEK_API_KEY is required to run the default DeepSeek runtime\n");
 
-  assert.equal(json.code, 0);
-  assert.equal(JSON.parse(json.stdout.trim().split("\n")[0]).version, 1);
+  assert.equal(json.code, 1);
+  assert.equal(json.stdout, "");
+  assert.equal(json.stderr, "DEEPSEEK_API_KEY is required to run the default DeepSeek runtime\n");
 });
 
 test("real entry exits non-zero for unknown options", async () => {

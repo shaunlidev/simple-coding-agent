@@ -1,5 +1,6 @@
-import type { AgentEvent } from "../../agent/src/index.js";
-import type { AssistantContent, AssistantMessage } from "../../ai/src/index.js";
+import type { AgentEvent } from "../../agent/dist/index.js";
+import type { AssistantContent, AssistantMessage } from "../../ai/dist/index.js";
+import { createLocalTools } from "./tools.js";
 
 export type CliMode = "print" | "json";
 
@@ -32,7 +33,7 @@ export type PromptRunner = {
   subscribe?(listener: (event: AgentEvent) => void | Promise<void>): () => void;
 };
 
-export type CliRuntimeFactory = (command: Extract<CliCommand, { kind: "run" }>) => PromptRunner;
+export type CliRuntimeFactory = (command: Extract<CliCommand, { kind: "run" }>) => PromptRunner | Promise<PromptRunner>;
 
 export const VERSION = "0.1.0";
 
@@ -135,12 +136,12 @@ export async function runCli(
   }
 
   try {
-    const runner = createRuntime(command);
+    const runner = await createRuntime(command);
     if (command.mode === "json") {
       const unsubscribe = runner.subscribe?.((event) => writeJsonLine(io, event));
       try {
         const message = await runner.prompt(command.prompt);
-        if (message.stopReason === "error") {
+        if (message.stopReason === "error" || message.stopReason === "aborted") {
           io.stderr.write(`${message.errorMessage ?? (assistantText(message) || "Agent failed")}\n`);
           return 1;
         }
@@ -151,7 +152,7 @@ export async function runCli(
     }
 
     const message = await runner.prompt(command.prompt);
-    if (message.stopReason === "error") {
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
       io.stderr.write(`${message.errorMessage ?? (assistantText(message) || "Agent failed")}\n`);
       return 1;
     }
@@ -163,31 +164,26 @@ export async function runCli(
   }
 }
 
-export function createDefaultRuntime(command: Extract<CliCommand, { kind: "run" }>): PromptRunner {
-  const listeners = new Set<(event: AgentEvent) => void | Promise<void>>();
-  return {
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    async prompt(prompt) {
-      const message: AssistantMessage = {
-        role: "assistant",
-        stopReason: "stop",
-        content: [{ type: "text", text: `Echo: ${prompt}` }],
-      };
-      const events: AgentEvent[] = [
-        { type: "agent_start", prompt },
-        { type: "agent_end", messages: [{ role: "user", content: prompt }, message] },
-      ];
-      for (const event of events) {
-        for (const listener of listeners) {
-          await listener(event);
-        }
-      }
-      return message;
-    },
+export async function createDefaultRuntime(command: Extract<CliCommand, { kind: "run" }>): Promise<PromptRunner> {
+  if (!process.env.DEEPSEEK_API_KEY) {
+    throw new Error("DEEPSEEK_API_KEY is required to run the default DeepSeek runtime");
+  }
+
+  const [agentModule, aiModule] = await Promise.all([
+    import("../../agent/dist/index.js"),
+    import("../../ai/dist/index.js"),
+  ]);
+  const { Agent } = agentModule as unknown as { Agent: new (options: Record<string, unknown>) => PromptRunner };
+  const { createDeepSeekProvider } = aiModule as unknown as {
+    createDeepSeekProvider(options: {
+      model?: string;
+      thinking?: boolean;
+    }): { models: readonly unknown[] };
   };
+  const provider = createDeepSeekProvider({ model: command.model, thinking: command.thinking });
+  return new Agent({
+    provider,
+    model: provider.models[0],
+    tools: createLocalTools({ allowedRoot: command.cwd ?? process.cwd() }),
+  });
 }

@@ -15,6 +15,14 @@ function sseResponse(events: readonly unknown[]): Response {
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return { promise, resolve };
+}
+
 async function collect(provider = createDeepSeekProvider({ apiKey: "test-key", fetch: async () => jsonResponse({
   choices: [{ finish_reason: "stop", message: { content: "hello" } }],
 }) })) {
@@ -153,6 +161,36 @@ test("request body uses OpenAI-compatible DeepSeek chat format", async () => {
   });
 });
 
+test("request body can require tool choice and enable thinking", async () => {
+  let requestBody: unknown;
+  const provider = createDeepSeekProvider({
+    apiKey: "test-key",
+    thinking: true,
+    toolChoice: "required",
+    fetch: async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body));
+      return jsonResponse({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] });
+    },
+  });
+
+  const stream = provider.stream(provider.models[0], {
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      {
+        name: "read",
+        description: "Read a file",
+        parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
+      },
+    ],
+  });
+  for await (const _ of stream) {
+    // drain
+  }
+
+  assert.equal((requestBody as { tool_choice?: string; thinking?: unknown }).tool_choice, "required");
+  assert.equal("thinking" in (requestBody as Record<string, unknown>), false);
+});
+
 test("streaming SSE chunks emit text and tool deltas", async () => {
   const provider = createDeepSeekProvider({
     apiKey: "test-key",
@@ -171,4 +209,52 @@ test("streaming SSE chunks emit text and tool deltas", async () => {
     ["hi ", "there"],
   );
   assert.deepEqual(message.content, [{ type: "text", text: "hi there" }]);
+});
+
+test("streaming SSE emits deltas before the response body is complete", async () => {
+  const encoder = new TextEncoder();
+  const secondChunk = deferred();
+  let waitingForSecondChunk = false;
+  const provider = createDeepSeekProvider({
+    apiKey: "test-key",
+    stream: true,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`));
+          },
+          async pull(controller) {
+            if (waitingForSecondChunk) return;
+            waitingForSecondChunk = true;
+            await secondChunk.promise;
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "!" }, finish_reason: "stop" }] })}\n\n`),
+            );
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+  });
+
+  const stream = provider.stream(provider.models[0], { messages: [{ role: "user", content: "hello" }] });
+  const iterator = stream[Symbol.asyncIterator]();
+  const seen = [];
+  while (true) {
+    const next = await iterator.next();
+    assert.equal(next.done, false);
+    seen.push(next.value);
+    if (next.value.type === "text_delta") break;
+  }
+
+  assert.equal(seen.some((event) => event.type === "text_delta" && event.delta === "hi"), true);
+  assert.equal(waitingForSecondChunk, true);
+
+  secondChunk.resolve();
+  while (!(await iterator.next()).done) {
+    // drain
+  }
+  assert.deepEqual((await stream.result()).content, [{ type: "text", text: "hi!" }]);
 });

@@ -24,4 +24,14 @@ export {
   type WriteArgs,
 } from "./tools.js";
 
+export {
+  appendSessionRecord,
+  parseSessionRecord,
+  readSessionRecords,
+  replaySessionMessages,
+  serializeSessionRecord,
+  SESSION_RECORD_VERSION,
+  type SessionRecord,
+} from "./session.js";
+
 export const codingAgentPackageReady = true;

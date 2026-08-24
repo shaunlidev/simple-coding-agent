@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createFauxProvider } from "../../ai/src/faux-provider.ts";
-import type { JsonObject, Provider, ToolDefinition } from "../../ai/src/index.ts";
+import { EventStream } from "../../ai/dist/event-stream.js";
+import { createFauxProvider } from "../../ai/dist/faux-provider.js";
+import type { AssistantMessage, JsonObject, Provider, StreamEvent, ToolDefinition } from "../../ai/dist/index.js";
 import { Agent, runAgentLoop } from "../src/index.ts";
 
 type ReadArgs = JsonObject & { path: string };
@@ -160,6 +161,51 @@ test("max-turn guard prevents infinite tool loops", async () => {
 
   await assert.rejects(drainPromise, /exceeded maxTurns 1/);
   await assert.rejects(resultPromise, /exceeded maxTurns 1/);
+});
+
+test("provider async failure becomes a clean assistant error and agent_end", async () => {
+  const provider: Provider = {
+    id: "broken",
+    name: "Broken Provider",
+    models: [{ id: "broken-model", name: "Broken Model", provider: "broken" }],
+    stream() {
+      const stream = new EventStream<StreamEvent, AssistantMessage>({
+        isTerminal: (event) => event.type === "done" || event.type === "error",
+        getResult: (event) => {
+          if (event.type === "done" || event.type === "error") return event.message;
+          throw new Error("terminal expected");
+        },
+      });
+      queueMicrotask(() => stream.fail(new Error("provider blew up")));
+      return stream;
+    },
+  };
+
+  const stream = runAgentLoop("hello", { provider });
+  const events = [];
+  for await (const event of stream) {
+    events.push(event);
+  }
+  const result = await stream.result();
+
+  assert.equal(events.at(-1)?.type, "agent_end");
+  assert.equal(result.assistant.stopReason, "error");
+  assert.equal(result.assistant.errorMessage, "provider blew up");
+});
+
+test("cancellation returns an aborted assistant message", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const handle = createFauxProvider({ responses: ["never"] });
+
+  const stream = runAgentLoop("hello", { provider: handle.provider, signal: controller.signal });
+  for await (const _ of stream) {
+    // drain
+  }
+  const result = await stream.result();
+
+  assert.equal(result.assistant.stopReason, "aborted");
+  assert.equal(result.assistant.errorMessage, "Operation aborted");
 });
 
 test("Agent commits messages only after a completed turn and returns defensive copies", async () => {

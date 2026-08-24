@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Agent } from "../../agent/src/index.ts";
-import { createFauxProvider } from "../../ai/src/faux-provider.ts";
+import { createFauxProvider } from "../../ai/dist/faux-provider.js";
 import { parseCliArgs, runCli } from "../src/cli.ts";
 
 test("parseCliArgs supports static commands and run modes", () => {

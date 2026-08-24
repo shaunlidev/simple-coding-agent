@@ -83,6 +83,22 @@ test("write creates parent directories inside root", async () => {
   assert.equal(await readTool({ path: "nested/out.txt" }, { allowedRoot: root }), "1: hello");
 });
 
+test("write rejects symlink parent escape", async () => {
+  const root = await createRoot();
+  const outside = await createRoot();
+
+  try {
+    await symlink(outside, join(root, "linked"));
+  } catch {
+    return;
+  }
+
+  await assert.rejects(
+    writeTool({ path: "linked/out.txt", content: "nope" }, { allowedRoot: root }),
+    /escapes allowed root/,
+  );
+});
+
 test("edit fails for missing or repeated oldText unless replaceAll is explicit", async () => {
   const root = await createRoot();
   await mkdir(join(root, "src"), { recursive: true });

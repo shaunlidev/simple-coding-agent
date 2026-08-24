@@ -21,6 +21,7 @@ declare module "node:assert/strict" {
 }
 
 declare module "node:fs/promises" {
+  export function appendFile(path: string, data: string | Uint8Array): Promise<void>;
   export function mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   export function mkdtemp(prefix: string): Promise<string>;
   export function readFile(path: string): Promise<Uint8Array>;
@@ -49,6 +50,7 @@ declare module "node:child_process" {
     args?: readonly string[],
     options?: {
       cwd?: string;
+      env?: Record<string, string | undefined>;
       shell?: boolean;
       signal?: AbortSignal;
     },

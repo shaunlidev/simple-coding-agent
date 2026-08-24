@@ -13,7 +13,10 @@ Build the minimal agent described in `../../ARCHITECTURE.md`, with local determi
 - [x] Phase 4: Agent loop and Agent class
 - [x] Phase 5: local tools
 - [x] Phase 6: print/json CLI
-- [x] Phase 7: DeepSeek provider and live smoke tests
+- [x] Phase 7: file tool safety hardening
+- [x] Phase 8: DeepSeek provider and opt-in live smoke tests
+- [x] Phase 9: CLI default runtime
+- [x] Phase 10: versioned session JSONL
 
 ## Decisions
 
@@ -25,9 +28,11 @@ Build the minimal agent described in `../../ARCHITECTURE.md`, with local determi
 - Tool argument validation uses a small local JSON-schema subset for now; the tests are the contract if this later moves to TypeBox/AJV.
 - Source `.js` shims in `packages/ai/src` exist only so Node's experimental TypeScript test runner can resolve build-style imports during local tests.
 - Agent loop uses Faux Provider for deterministic local tests and treats unknown tools as runtime failures.
-- Local tools enforce workspace root boundaries before read/write/edit/bash behavior is exposed to the agent.
-- CLI static commands never initialize runtime; default local CLI runtime uses deterministic echo behavior for smoke tests.
-- DeepSeek uses the official OpenAI-compatible `/chat/completions` endpoint with thinking disabled for MVP; live tests are opt-in through `DEEPSEEK_API_KEY`.
+- Local tools enforce workspace root boundaries before read/write/edit/bash behavior is exposed to the agent, including symlink parent checks for writes.
+- CLI static commands never initialize runtime; run mode now requires `DEEPSEEK_API_KEY` and composes `Agent + DeepSeekProvider + local tools` by default.
+- DeepSeek uses the official OpenAI-compatible `/chat/completions` endpoint with thinking disabled by default; `--thinking` opts out of that disabled-thinking request field.
+- DeepSeek streaming SSE is consumed incrementally, and `tool_choice` is available for live tool-call smoke tests.
+- Session records are versioned JSONL and reject unsupported future versions before replay.
 
 ## Acceptance Gates
 
@@ -35,4 +40,6 @@ Build the minimal agent described in `../../ARCHITECTURE.md`, with local determi
 npm run check
 npm run build
 npm run test
+npm run eval
+npm run test:live
 ```

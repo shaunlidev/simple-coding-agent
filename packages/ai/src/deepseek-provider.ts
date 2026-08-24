@@ -17,6 +17,8 @@ export type DeepSeekProviderOptions = {
   baseUrl?: string;
   model?: string;
   stream?: boolean;
+  thinking?: boolean;
+  toolChoice?: "auto" | "required" | "none";
   fetch?: typeof fetch;
 };
 
@@ -224,40 +226,27 @@ type StreamingToolState = {
   started: boolean;
 };
 
-async function readStreamText(response: Response): Promise<string> {
-  const body = response.body;
-  if (!body) return "";
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    text += decoder.decode(value, { stream: true });
-  }
-
-  return text + decoder.decode();
-}
-
-function parseSseEvents(text: string): DeepSeekChunk[] {
+function parseSseEvent(text: string): DeepSeekChunk[] {
   const chunks: DeepSeekChunk[] = [];
-  for (const event of text.split(/\n\n/)) {
-    for (const line of event.split(/\r?\n/)) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice("data:".length).trim();
-      if (!data || data === "[DONE]") continue;
-      chunks.push(JSON.parse(data));
-    }
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice("data:".length).trim();
+    if (!data || data === "[DONE]") continue;
+    chunks.push(JSON.parse(data));
   }
   return chunks;
 }
 
-function produceFromStreamingChunks(
-  stream: ReturnType<typeof createAssistantMessageEventStream>,
-  chunks: readonly DeepSeekChunk[],
-): void {
-  stream.push({ type: "start" });
+function findSseBoundary(buffer: string): { index: number; length: number } | undefined {
+  const lf = buffer.indexOf("\n\n");
+  const crlf = buffer.indexOf("\r\n\r\n");
+  if (lf === -1 && crlf === -1) return undefined;
+  if (lf === -1) return { index: crlf, length: 4 };
+  if (crlf === -1) return { index: lf, length: 2 };
+  return lf < crlf ? { index: lf, length: 2 } : { index: crlf, length: 4 };
+}
+
+function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessageEventStream>) {
   const content: AssistantContent[] = [];
   const tools = new Map<number, StreamingToolState>();
   let textIndex: number | undefined;
@@ -267,9 +256,9 @@ function produceFromStreamingChunks(
   let nextContentIndex = 0;
   let finishReason = "stop";
 
-  for (const chunk of chunks) {
+  function accept(chunk: DeepSeekChunk): void {
     const choice = chunk.choices?.[0];
-    if (!choice) continue;
+    if (!choice) return;
     const delta = choice.delta ?? {};
     if (choice.finish_reason) finishReason = choice.finish_reason;
 
@@ -336,27 +325,71 @@ function produceFromStreamingChunks(
     }
   }
 
-  if (thinkingIndex !== undefined) {
-    stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinking });
-    content.push({ type: "thinking", thinking });
-  }
-  if (textIndex !== undefined) {
-    stream.push({ type: "text_end", contentIndex: textIndex, content: text });
-    content.push({ type: "text", text });
-  }
-  for (const tool of [...tools.values()].sort((left, right) => left.contentIndex - right.contentIndex)) {
-    const block: ToolCallContent = {
-      type: "tool_call",
-      id: tool.id,
-      name: tool.name,
-      arguments: parseToolArguments(tool.argumentsJson || "{}"),
-    };
-    stream.push({ type: "tool_call_end", contentIndex: tool.contentIndex, toolCall: block });
-    content.push(block);
+  function finish(): void {
+    if (thinkingIndex !== undefined) {
+      stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinking });
+      content.push({ type: "thinking", thinking });
+    }
+    if (textIndex !== undefined) {
+      stream.push({ type: "text_end", contentIndex: textIndex, content: text });
+      content.push({ type: "text", text });
+    }
+    for (const tool of [...tools.values()].sort((left, right) => left.contentIndex - right.contentIndex)) {
+      const block: ToolCallContent = {
+        type: "tool_call",
+        id: tool.id,
+        name: tool.name,
+        arguments: parseToolArguments(tool.argumentsJson || "{}"),
+      };
+      stream.push({ type: "tool_call_end", contentIndex: tool.contentIndex, toolCall: block });
+      content.push(block);
+    }
+
+    const stopReason = mapStopReason(finishReason);
+    stream.push({ type: "done", reason: stopReason, message: { role: "assistant", stopReason, content } });
   }
 
-  const stopReason = mapStopReason(finishReason);
-  stream.push({ type: "done", reason: stopReason, message: { role: "assistant", stopReason, content } });
+  return { accept, finish };
+}
+
+async function produceFromStreamingResponse(
+  stream: ReturnType<typeof createAssistantMessageEventStream>,
+  response: Response,
+): Promise<void> {
+  stream.push({ type: "start" });
+  const assembler = createStreamingAssembler(stream);
+  const body = response.body;
+  if (!body) {
+    assembler.finish();
+    return;
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary = findSseBoundary(buffer);
+    while (boundary) {
+      const eventText = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary.length);
+      for (const chunk of parseSseEvent(eventText)) {
+        assembler.accept(chunk);
+      }
+      boundary = findSseBoundary(buffer);
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    for (const chunk of parseSseEvent(buffer)) {
+      assembler.accept(chunk);
+    }
+  }
+  assembler.finish();
 }
 
 export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): Provider {
@@ -381,7 +414,8 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): P
             messages: toChatMessages(context),
             tools: toDeepSeekTools(context.tools),
             stream: options.stream === true,
-            thinking: { type: "disabled" },
+            ...(options.thinking === true ? {} : { thinking: { type: "disabled" } }),
+            ...(options.toolChoice ? { tool_choice: options.toolChoice } : {}),
           };
           const response = await doFetch(`${baseUrl}/chat/completions`, {
             method: "POST",
@@ -398,7 +432,7 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): P
           }
 
           if (options.stream === true) {
-            produceFromStreamingChunks(stream, parseSseEvents(await readStreamText(response)));
+            await produceFromStreamingResponse(stream, response);
           } else {
             produceFromMessage(stream, (await response.json()) as DeepSeekChatResponse);
           }

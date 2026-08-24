@@ -21,4 +21,5 @@ Capture:
 - `createFauxProviderHarness`: deterministic model responses and provider event traces.
 - `createAgentHarness`: temp workspace, faux provider, default tools, transcript, event capture.
 - CLI process harness: real process boundary, stdout/stderr/exit code.
-- Live DeepSeek harness: opt-in model-backed smoke tests.
+- Session JSONL harness: versioned records, append/read order, message replay, and future-version rejection.
+- Live DeepSeek harness: opt-in model-backed text smoke plus required-tool-call smoke through the local `read` tool.
