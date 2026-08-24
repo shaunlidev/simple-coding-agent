@@ -12,6 +12,13 @@ export type TuiCommand =
   | { kind: "help" }
   | { kind: "version" }
   | {
+      kind: "interactive";
+      cwd?: string;
+      model?: string;
+      thinking?: boolean;
+      sessionPath?: string;
+    }
+  | {
       kind: "run";
       prompt: string;
       cwd?: string;
@@ -22,9 +29,11 @@ export type TuiCommand =
 
 export type TuiRunOptions = {
   signal?: AbortSignal;
+  input?: TuiInput;
 };
 
 type TuiRuntimeCommand = Extract<TuiCommand, { kind: "run" }> & { kind: "run"; mode: "print" };
+type TuiInteractiveCommand = Extract<TuiCommand, { kind: "interactive" }>;
 
 type TuiPromptRunner = {
   prompt(prompt: string, options?: { signal?: AbortSignal }): Promise<AssistantMessage>;
@@ -32,11 +41,22 @@ type TuiPromptRunner = {
 };
 
 type TuiRuntimeFactory = (command: TuiRuntimeCommand) => TuiPromptRunner | Promise<TuiPromptRunner>;
+export type TuiInput = {
+  question(prompt: string, options?: { signal?: AbortSignal }): Promise<string | undefined>;
+  close?(): void;
+};
+
+type TuiState = {
+  cwd?: string;
+  model?: string;
+  thinking?: boolean;
+  sessionPath?: string;
+};
 
 const VERSION = "0.1.0";
 const defaultRuntimeFactory = createDefaultRuntime as unknown as TuiRuntimeFactory;
 
-const USAGE = `Usage: simple-coding-agent-tui [--cwd PATH] [--model MODEL] [--thinking] [--session PATH] <prompt>
+const USAGE = `Usage: simple-coding-agent-tui [--cwd PATH] [--model MODEL] [--thinking] [--session PATH] [prompt]
 
 Options:
   --help           Show help
@@ -45,6 +65,27 @@ Options:
   --model MODEL    DeepSeek model id
   --thinking       Allow provider thinking when supported
   --session PATH   Append versioned JSONL session records
+
+With no prompt, starts interactive mode.
+
+Interactive commands:
+  /help            Show interactive commands
+  /quit, /exit     Exit
+  /clear           Reset conversation context
+  /cwd PATH        Change working directory and reset context
+  /model MODEL     Change model and reset context
+  /thinking on|off Toggle thinking and reset context
+  /session PATH    Append future turns to a session JSONL file
+`;
+
+const INTERACTIVE_HELP = `Commands:
+  /help
+  /quit, /exit
+  /clear
+  /cwd PATH
+  /model MODEL
+  /thinking on|off
+  /session PATH
 `;
 
 function assistantText(message: AssistantMessage): string {
@@ -64,9 +105,6 @@ function renderEvent(event: AgentEvent): string | undefined {
   }
   if (event.type === "tool_end") {
     return `tool: ${event.message.toolName} ${event.message.isError ? "error" : "ok"}\n`;
-  }
-  if (event.type === "agent_end") {
-    return "status: done\n";
   }
   return undefined;
 }
@@ -122,11 +160,229 @@ export function parseTuiArgs(argv: readonly string[]): TuiCommand {
   }
 
   const prompt = rest.join(" ").trim();
-  if (!prompt) {
-    throw new CliUsageError("A prompt is required for non-interactive TUI mode.");
-  }
+  if (!prompt) return { kind: "interactive", cwd, model, thinking, sessionPath };
 
   return { kind: "run", prompt, cwd, model, thinking, sessionPath };
+}
+
+function writeHeader(io: CliIo, state: TuiState): void {
+  io.stdout.write("Simple Coding Agent TUI\n");
+  io.stdout.write(`cwd: ${state.cwd ?? process.cwd()}\n`);
+  io.stdout.write(`model: ${state.model ?? "deepseek-v4-pro"}\n`);
+  io.stdout.write(`thinking: ${state.thinking ? "on" : "off"}\n`);
+  io.stdout.write(`session: ${state.sessionPath ?? "(none)"}\n`);
+}
+
+function commandFromState(prompt: string, state: TuiState): TuiRuntimeCommand {
+  return {
+    kind: "run",
+    mode: "print",
+    prompt,
+    cwd: state.cwd,
+    model: state.model,
+    thinking: state.thinking,
+    sessionPath: state.sessionPath,
+  };
+}
+
+async function runPromptTurn(
+  prompt: string,
+  state: TuiState,
+  io: CliIo,
+  runner: TuiPromptRunner,
+  options: { signal?: AbortSignal } = {},
+): Promise<{ code: number; message?: AssistantMessage }> {
+  io.stdout.write("status: running\n");
+  await appendSafeSessionMessage(state.sessionPath, { role: "user", content: prompt });
+
+  const unsubscribe = runner.subscribe?.((event) => {
+    const line = renderEvent(event);
+    if (line) io.stdout.write(line);
+    return appendSafeSessionEvent(state.sessionPath, event);
+  });
+
+  let message: AssistantMessage;
+  try {
+    message = await runner.prompt(prompt, { signal: options.signal });
+  } finally {
+    unsubscribe?.();
+  }
+  await appendSafeSessionMessage(state.sessionPath, message);
+
+  if (message.stopReason === "error" || message.stopReason === "aborted") {
+    io.stdout.write(`status: ${message.stopReason}\n`);
+    io.stderr.write(`${message.errorMessage ?? (assistantText(message) || "Agent failed")}\n`);
+    return { code: message.stopReason === "aborted" ? 130 : 1, message };
+  }
+
+  io.stdout.write("status: done\n");
+  io.stdout.write(`assistant: ${assistantText(message)}\n`);
+  return { code: 0, message };
+}
+
+async function runOneShotTui(
+  command: Extract<TuiCommand, { kind: "run" }>,
+  io: CliIo,
+  createRuntime: TuiRuntimeFactory,
+  options: TuiRunOptions,
+): Promise<number> {
+  try {
+    const state: TuiState = {
+      cwd: command.cwd,
+      model: command.model,
+      thinking: command.thinking,
+      sessionPath: command.sessionPath,
+    };
+    writeHeader(io, state);
+
+    const runner: TuiPromptRunner = await createRuntime(commandFromState(command.prompt, state));
+    const result = await runPromptTurn(command.prompt, state, io, runner, { signal: options.signal });
+    return result.code;
+  } catch (error) {
+    io.stderr.write(`${normalizeError(error)}\n`);
+    return 1;
+  }
+}
+
+function createRuntimeResetMessage(state: TuiState): string {
+  return `cwd: ${state.cwd ?? process.cwd()}\nmodel: ${state.model ?? "deepseek-v4-pro"}\nthinking: ${state.thinking ? "on" : "off"}\nsession: ${state.sessionPath ?? "(none)"}\n`;
+}
+
+function parseOnOff(value: string | undefined): boolean | undefined {
+  if (value === "on" || value === "true" || value === "1") return true;
+  if (value === "off" || value === "false" || value === "0") return false;
+  return undefined;
+}
+
+async function runInteractiveCommand(
+  line: string,
+  state: TuiState,
+  io: CliIo,
+): Promise<"continue" | "quit" | "reset"> {
+  const [name = "", ...rest] = line.trim().split(/\s+/);
+  const value = rest.join(" ").trim();
+
+  if (name === "/quit" || name === "/exit") return "quit";
+  if (name === "/help") {
+    io.stdout.write(INTERACTIVE_HELP);
+    return "continue";
+  }
+  if (name === "/clear") {
+    io.stdout.write("status: context cleared\n");
+    return "reset";
+  }
+  if (name === "/cwd") {
+    if (!value) {
+      io.stderr.write("/cwd requires a path\n");
+      return "continue";
+    }
+    state.cwd = value;
+    io.stdout.write(createRuntimeResetMessage(state));
+    return "reset";
+  }
+  if (name === "/model") {
+    if (!value) {
+      io.stderr.write("/model requires a model id\n");
+      return "continue";
+    }
+    state.model = value;
+    io.stdout.write(createRuntimeResetMessage(state));
+    return "reset";
+  }
+  if (name === "/thinking") {
+    const next = parseOnOff(value);
+    if (next === undefined) {
+      io.stderr.write("/thinking requires on or off\n");
+      return "continue";
+    }
+    state.thinking = next;
+    io.stdout.write(createRuntimeResetMessage(state));
+    return "reset";
+  }
+  if (name === "/session") {
+    if (!value) {
+      io.stderr.write("/session requires a path\n");
+      return "continue";
+    }
+    state.sessionPath = value;
+    io.stdout.write(`session: ${state.sessionPath}\n`);
+    return "continue";
+  }
+
+  io.stderr.write(`Unknown command: ${name}\n`);
+  return "continue";
+}
+
+async function createDefaultInput(): Promise<TuiInput> {
+  const readline = await import("node:readline");
+  const readlineInterface = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const iterator = readlineInterface[Symbol.asyncIterator]();
+  return {
+    async question(prompt, options) {
+      if (options?.signal?.aborted) return undefined;
+      process.stdout.write(prompt);
+      const next = await iterator.next();
+      return next.done ? undefined : next.value;
+    },
+    close() {
+      readlineInterface.close();
+    },
+  };
+}
+
+async function runInteractiveTui(
+  command: TuiInteractiveCommand,
+  io: CliIo,
+  createRuntime: TuiRuntimeFactory,
+  options: TuiRunOptions,
+): Promise<number> {
+  const state: TuiState = {
+    cwd: command.cwd,
+    model: command.model,
+    thinking: command.thinking,
+    sessionPath: command.sessionPath,
+  };
+
+  const input = options.input ?? (await createDefaultInput());
+  let runner: TuiPromptRunner | undefined;
+  let turn = 0;
+
+  writeHeader(io, state);
+  io.stdout.write("type /help for commands\n");
+
+  try {
+    while (true) {
+      const line = await input.question("> ", { signal: options.signal });
+      if (line === undefined) return 0;
+      const prompt = line.trim();
+      if (!prompt) continue;
+
+      if (prompt.startsWith("/")) {
+        const result = await runInteractiveCommand(prompt, state, io);
+        if (result === "quit") return 0;
+        if (result === "reset") runner = undefined;
+        continue;
+      }
+
+      turn += 1;
+      io.stdout.write(`turn: ${turn}\n`);
+      runner ??= await createRuntime(commandFromState(prompt, state));
+      const result = await runPromptTurn(prompt, state, io, runner, { signal: options.signal });
+      if (result.code === 130) return 130;
+    }
+  } catch (error) {
+    if (options.signal?.aborted) {
+      io.stdout.write("status: aborted\n");
+      return 130;
+    }
+    io.stderr.write(`${normalizeError(error)}\n`);
+    return 1;
+  } finally {
+    input.close?.();
+  }
 }
 
 export async function runTui(
@@ -152,48 +408,11 @@ export async function runTui(
     return 0;
   }
 
-  try {
-    io.stdout.write("Simple Coding Agent TUI\n");
-    io.stdout.write(`cwd: ${command.cwd ?? process.cwd()}\n`);
-    io.stdout.write(`model: ${command.model ?? "deepseek-v4-pro"}\n`);
-    io.stdout.write("status: running\n");
-    await appendSafeSessionMessage(command.sessionPath, { role: "user", content: command.prompt });
-
-    const runner: TuiPromptRunner = await createRuntime({
-      kind: "run",
-      mode: "print",
-      prompt: command.prompt,
-      cwd: command.cwd,
-      model: command.model,
-      thinking: command.thinking,
-      sessionPath: command.sessionPath,
-    });
-    const unsubscribe = runner.subscribe?.((event) => {
-      const line = renderEvent(event);
-      if (line) io.stdout.write(line);
-      return appendSafeSessionEvent(command.sessionPath, event);
-    });
-
-    let message: AssistantMessage;
-    try {
-      message = await runner.prompt(command.prompt, { signal: options.signal });
-    } finally {
-      unsubscribe?.();
-    }
-    await appendSafeSessionMessage(command.sessionPath, message);
-
-    if (message.stopReason === "error" || message.stopReason === "aborted") {
-      io.stdout.write(`status: ${message.stopReason}\n`);
-      io.stderr.write(`${message.errorMessage ?? (assistantText(message) || "Agent failed")}\n`);
-      return message.stopReason === "aborted" ? 130 : 1;
-    }
-
-    io.stdout.write(`assistant: ${assistantText(message)}\n`);
-    return 0;
-  } catch (error) {
-    io.stderr.write(`${normalizeError(error)}\n`);
-    return 1;
+  if (command.kind === "interactive") {
+    return runInteractiveTui(command, io, createRuntime, options);
   }
+
+  return runOneShotTui(command, io, createRuntime, options);
 }
 
 export const tuiPackageReady = true;

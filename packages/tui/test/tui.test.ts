@@ -3,7 +3,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { parseTuiArgs, runTui } from "../src/index.ts";
+import { parseTuiArgs, runTui, type TuiInput } from "../src/index.ts";
 
 function createIo(): { output: { stdout: string; stderr: string }; io: { stdout: { write(chunk: string): void }; stderr: { write(chunk: string): void } } } {
   const output = { stdout: "", stderr: "" };
@@ -16,9 +16,29 @@ function createIo(): { output: { stdout: string; stderr: string }; io: { stdout:
   };
 }
 
+function createInput(lines: readonly string[]): TuiInput & { closed: boolean } {
+  const pending = [...lines];
+  return {
+    closed: false,
+    async question() {
+      return pending.shift();
+    },
+    close() {
+      this.closed = true;
+    },
+  };
+}
+
 test("parseTuiArgs supports static and run commands", () => {
   assert.deepEqual(parseTuiArgs(["--help"]), { kind: "help" });
   assert.deepEqual(parseTuiArgs(["--version"]), { kind: "version" });
+  assert.deepEqual(parseTuiArgs([]), {
+    kind: "interactive",
+    cwd: undefined,
+    model: undefined,
+    thinking: false,
+    sessionPath: undefined,
+  });
   assert.deepEqual(parseTuiArgs(["--cwd", "/tmp/work", "--model", "deepseek-v4-flash", "--thinking", "do", "it"]), {
     kind: "run",
     prompt: "do it",
@@ -76,7 +96,108 @@ test("TUI run mode renders status, tool events, and assistant text", async () =>
   assert.equal(output.stdout.includes("model: model-a"), true);
   assert.equal(output.stdout.includes("tool: read started"), true);
   assert.equal(output.stdout.includes("tool: read ok"), true);
+  assert.equal(output.stdout.includes("status: done"), true);
   assert.equal(output.stdout.includes("assistant: done"), true);
+});
+
+test("interactive TUI reuses one runner for multiple prompts", async () => {
+  const { output, io } = createIo();
+  const input = createInput(["first", "second", "/quit"]);
+  const prompts: string[] = [];
+  let runtimes = 0;
+
+  const code = await runTui(
+    [],
+    io,
+    () => {
+      runtimes += 1;
+      return {
+        async prompt(prompt) {
+          prompts.push(prompt);
+          return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `answer:${prompt}` }] };
+        },
+      };
+    },
+    { input },
+  );
+
+  assert.equal(code, 0);
+  assert.equal(runtimes, 1);
+  assert.deepEqual(prompts, ["first", "second"]);
+  assert.equal(output.stdout.includes("type /help for commands"), true);
+  assert.equal(output.stdout.includes("turn: 1"), true);
+  assert.equal(output.stdout.includes("turn: 2"), true);
+  assert.equal(output.stdout.includes("assistant: answer:first"), true);
+  assert.equal(output.stdout.includes("assistant: answer:second"), true);
+  assert.equal(input.closed, true);
+});
+
+test("interactive TUI clear resets runtime for the next prompt", async () => {
+  const { output, io } = createIo();
+  const input = createInput(["first", "/clear", "second", "/quit"]);
+  const promptsByRuntime: string[][] = [];
+
+  const code = await runTui(
+    [],
+    io,
+    () => {
+      const prompts: string[] = [];
+      promptsByRuntime.push(prompts);
+      return {
+        async prompt(prompt) {
+          prompts.push(prompt);
+          return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] };
+        },
+      };
+    },
+    { input },
+  );
+
+  assert.equal(code, 0);
+  assert.equal(output.stdout.includes("status: context cleared"), true);
+  assert.deepEqual(promptsByRuntime, [["first"], ["second"]]);
+});
+
+test("interactive TUI cwd, model, and thinking commands update the next runtime", async () => {
+  const { output, io } = createIo();
+  const input = createInput([
+    "/cwd /tmp/next",
+    "/model model-b",
+    "/thinking on",
+    "inspect",
+    "/quit",
+  ]);
+  const runtimeCommands: unknown[] = [];
+
+  const code = await runTui(
+    [],
+    io,
+    (command) => {
+      runtimeCommands.push(command);
+      return {
+        async prompt() {
+          return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] };
+        },
+      };
+    },
+    { input },
+  );
+
+  assert.equal(code, 0);
+  assert.equal(output.stdout.includes("cwd: /tmp/next"), true);
+  assert.equal(output.stdout.includes("model: model-b"), true);
+  assert.equal(output.stdout.includes("thinking: on"), true);
+  assert.deepEqual(runtimeCommands, [
+    {
+      kind: "run",
+      mode: "print",
+      prompt: "inspect",
+      cwd: "/tmp/next",
+      model: "model-b",
+      thinking: true,
+      sessionPath: undefined,
+    },
+  ]);
 });
 
 test("TUI session path records prompt, events, and final assistant", async () => {
@@ -109,6 +230,38 @@ test("TUI session path records prompt, events, and final assistant", async () =>
   assert.equal(code, 0);
   assert.deepEqual(records.map((record) => record.type), ["message", "event", "message"]);
   assert.deepEqual(records.map((record) => record.version), [1, 1, 1]);
+});
+
+test("interactive TUI session path records every prompt and assistant message", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-interactive-"));
+  const sessionPath = join(root, "session.jsonl");
+  const { io } = createIo();
+  const input = createInput(["one", "two", "/quit"]);
+
+  const code = await runTui(
+    ["--session", sessionPath],
+    io,
+    () => ({
+      async prompt(prompt) {
+        return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `reply ${prompt}` }] };
+      },
+    }),
+    { input },
+  );
+
+  const records = new TextDecoder()
+    .decode(await readFile(sessionPath))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+
+  assert.equal(code, 0);
+  assert.deepEqual(records.map((record) => record.type), ["message", "message", "message", "message"]);
+  assert.deepEqual(
+    records.map((record) => record.message.role),
+    ["user", "assistant", "user", "assistant"],
+  );
+  assert.deepEqual(records.map((record) => record.version), [1, 1, 1, 1]);
 });
 
 test("TUI reports aborted runs distinctly", async () => {

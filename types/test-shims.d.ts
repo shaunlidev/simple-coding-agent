@@ -63,6 +63,16 @@ declare module "node:child_process" {
   };
 }
 
+declare module "node:readline" {
+  export function createInterface(options: {
+    input: unknown;
+    output: unknown;
+  }): {
+    [Symbol.asyncIterator](): AsyncIterator<string>;
+    close(): void;
+  };
+}
+
 declare const Buffer: {
   from(data: Uint8Array | string): {
     includes(value: number): boolean;
@@ -76,6 +86,7 @@ declare const process: {
   env: Record<string, string | undefined>;
   exitCode?: number;
   cwd(): string;
+  stdin: unknown;
   stdout: { write(chunk: string): void };
   stderr: { write(chunk: string): void };
 };

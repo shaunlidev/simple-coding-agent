@@ -1,11 +1,11 @@
 # Simple Coding Agent
 
-Simple Coding Agent is a local-first TypeScript coding-agent MVP. It currently ships a runnable CLI and a minimal terminal task UI. Both use the same agent loop, DeepSeek provider, and local file tools.
+Simple Coding Agent is a local-first TypeScript coding-agent MVP. It currently ships a runnable CLI and an interactive terminal UI. Both use the same agent loop, DeepSeek provider, and local file tools.
 
 Status:
 
 - CLI MVP: available locally after build.
-- Minimal TUI: available locally after build.
+- Interactive TUI: available locally after build.
 - npm publishing: not supported yet. This repository is GitHub-only for now.
 
 ## Requirements
@@ -48,7 +48,13 @@ Run the CLI with a key in your environment:
 DEEPSEEK_API_KEY=your_key_here npm run agent -- --print "Reply exactly ok"
 ```
 
-Run the terminal UI:
+Chat in the terminal UI:
+
+```bash
+DEEPSEEK_API_KEY=your_key_here npm run tui
+```
+
+Or run a one-shot terminal UI task:
 
 ```bash
 DEEPSEEK_API_KEY=your_key_here npm run tui -- "Reply exactly ok"
@@ -67,6 +73,22 @@ npm run agent -- --resume .agent-session.jsonl --print "Continue"
 ```
 
 Without `DEEPSEEK_API_KEY`, run mode fails clearly before provider initialization.
+
+## TUI Usage
+
+```bash
+npm run tui
+```
+
+Interactive commands:
+
+- `/help`
+- `/quit` or `/exit`
+- `/clear`
+- `/cwd PATH`
+- `/model MODEL`
+- `/thinking on|off`
+- `/session PATH`
 
 ## Local Safety
 
