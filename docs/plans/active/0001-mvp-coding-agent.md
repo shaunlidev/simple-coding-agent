@@ -9,7 +9,7 @@ Build the minimal agent described in `../../ARCHITECTURE.md`, with local determi
 - [x] Phase 0: repository knowledge map and monorepo scaffold
 - [x] Phase 1: EventStream
 - [x] Phase 2: provider event validator
-- [ ] Phase 3: tool argument validation and Faux Provider
+- [x] Phase 3: tool argument validation and Faux Provider
 - [ ] Phase 4: Agent loop and Agent class
 - [ ] Phase 5: local tools
 - [ ] Phase 6: print/json CLI
@@ -22,6 +22,8 @@ Build the minimal agent described in `../../ARCHITECTURE.md`, with local determi
 - Use repository-local docs as the system of record.
 - Provider stream events are validated as an ordered sequence before they are yielded to consumers.
 - Tool-call argument deltas are accumulated as JSON text and parsed only at `tool_call_end`.
+- Tool argument validation uses a small local JSON-schema subset for now; the tests are the contract if this later moves to TypeBox/AJV.
+- Source `.js` shims in `packages/ai/src` exist only so Node's experimental TypeScript test runner can resolve build-style imports during local tests.
 
 ## Acceptance Gates
 

@@ -11,6 +11,8 @@ npm run eval
 
 These commands must not require network or a real API key.
 
+The test runner executes `.ts` test files directly with Node's experimental type transform. Build-style `.js` imports remain in production TypeScript sources, so tiny source shims may exist beside selected `.ts` files when a direct source test needs Node to resolve that import without a compiled `dist` tree.
+
 ## Live DeepSeek Gate
 
 ```bash
