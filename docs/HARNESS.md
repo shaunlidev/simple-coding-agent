@@ -28,5 +28,5 @@ Capture:
 
 - `packages/coding-agent/test/process-harness.ts` runs source entries across a real Node process boundary.
 - CLI tests cover stdout, stderr, exit codes, session records, resume, and secret redaction failures.
-- TUI tests cover startup, one-shot mode, interactive multi-turn reuse, slash-command resets, rendered status, tool events, session records, abort, and no-key failure.
+- TUI tests cover startup, one-shot mode, interactive multi-turn reuse, slash-command resets, streaming text deltas without final duplication, rendered status, tool events, session records, abort, and no-key failure.
 - Local evals cover read, edit, path escape rejection, tool-error recovery, and max-turn stop.

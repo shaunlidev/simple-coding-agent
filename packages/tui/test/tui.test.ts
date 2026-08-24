@@ -92,12 +92,41 @@ test("TUI run mode renders status, tool events, and assistant text", async () =>
 
   assert.equal(code, 0);
   assert.equal(output.stderr, "");
-  assert.equal(output.stdout.includes("cwd: /tmp/work"), true);
-  assert.equal(output.stdout.includes("model: model-a"), true);
-  assert.equal(output.stdout.includes("tool: read started"), true);
-  assert.equal(output.stdout.includes("tool: read ok"), true);
-  assert.equal(output.stdout.includes("status: done"), true);
-  assert.equal(output.stdout.includes("assistant: done"), true);
+  assert.equal(output.stdout.includes("cwd      /tmp/work"), true);
+  assert.equal(output.stdout.includes("model    model-a"), true);
+  assert.equal(output.stdout.includes("You\n  hello"), true);
+  assert.equal(output.stdout.includes("Tools\n  [start] read {}"), true);
+  assert.equal(output.stdout.includes("  [ok] read ok"), true);
+  assert.equal(output.stdout.includes("Agent\n  done"), true);
+  assert.equal(output.stdout.includes("status done"), true);
+});
+
+test("TUI streams provider text deltas and does not duplicate final text", async () => {
+  const { output, io } = createIo();
+  const listeners = new Set<(event: { type: "provider_event"; turn: number; event: { type: "text_delta"; contentIndex: number; delta: string } }) => void | Promise<void>>();
+
+  const code = await runTui(
+    ["hello"],
+    io,
+    () => ({
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      async prompt() {
+        for (const listener of listeners) {
+          await listener({ type: "provider_event", turn: 1, event: { type: "text_delta", contentIndex: 0, delta: "hel" } });
+          await listener({ type: "provider_event", turn: 1, event: { type: "text_delta", contentIndex: 0, delta: "lo" } });
+        }
+        return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "hello" }] };
+      },
+    }),
+  );
+
+  assert.equal(code, 0);
+  assert.equal(output.stdout.includes("Agent\n  hello"), true);
+  assert.equal(output.stdout.match(/hello/g)?.length, 2);
+  assert.equal(output.stdout.includes("assistant: hello"), false);
 });
 
 test("interactive TUI reuses one runner for multiple prompts", async () => {
@@ -125,10 +154,10 @@ test("interactive TUI reuses one runner for multiple prompts", async () => {
   assert.equal(runtimes, 1);
   assert.deepEqual(prompts, ["first", "second"]);
   assert.equal(output.stdout.includes("type /help for commands"), true);
-  assert.equal(output.stdout.includes("turn: 1"), true);
-  assert.equal(output.stdout.includes("turn: 2"), true);
-  assert.equal(output.stdout.includes("assistant: answer:first"), true);
-  assert.equal(output.stdout.includes("assistant: answer:second"), true);
+  assert.equal(output.stdout.includes("Turn 1"), true);
+  assert.equal(output.stdout.includes("Turn 2"), true);
+  assert.equal(output.stdout.includes("Agent\n  answer:first"), true);
+  assert.equal(output.stdout.includes("Agent\n  answer:second"), true);
   assert.equal(input.closed, true);
 });
 
@@ -154,7 +183,7 @@ test("interactive TUI clear resets runtime for the next prompt", async () => {
   );
 
   assert.equal(code, 0);
-  assert.equal(output.stdout.includes("status: context cleared"), true);
+  assert.equal(output.stdout.includes("status context cleared"), true);
   assert.deepEqual(promptsByRuntime, [["first"], ["second"]]);
 });
 
@@ -184,9 +213,9 @@ test("interactive TUI cwd, model, and thinking commands update the next runtime"
   );
 
   assert.equal(code, 0);
-  assert.equal(output.stdout.includes("cwd: /tmp/next"), true);
-  assert.equal(output.stdout.includes("model: model-b"), true);
-  assert.equal(output.stdout.includes("thinking: on"), true);
+  assert.equal(output.stdout.includes("cwd      /tmp/next"), true);
+  assert.equal(output.stdout.includes("model    model-b"), true);
+  assert.equal(output.stdout.includes("thinking on"), true);
   assert.deepEqual(runtimeCommands, [
     {
       kind: "run",
@@ -282,7 +311,7 @@ test("TUI reports aborted runs distinctly", async () => {
   );
 
   assert.equal(code, 130);
-  assert.equal(output.stdout.includes("status: aborted"), true);
+  assert.equal(output.stdout.includes("status aborted"), true);
   assert.equal(output.stderr, "Operation aborted\n");
 });
 

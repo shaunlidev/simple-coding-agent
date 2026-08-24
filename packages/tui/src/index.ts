@@ -1,5 +1,5 @@
 import type { AgentEvent } from "../../agent/dist/index.js";
-import type { AssistantContent, AssistantMessage, Message } from "../../ai/dist/index.js";
+import type { AssistantContent, AssistantMessage, Message, StreamEvent } from "../../ai/dist/index.js";
 import {
   appendSessionRecord,
   createDefaultRuntime,
@@ -53,6 +53,11 @@ type TuiState = {
   sessionPath?: string;
 };
 
+type TuiRenderState = {
+  assistantOpen: boolean;
+  streamedText: string;
+};
+
 const VERSION = "0.1.0";
 const defaultRuntimeFactory = createDefaultRuntime as unknown as TuiRuntimeFactory;
 
@@ -99,12 +104,68 @@ function normalizeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function renderEvent(event: AgentEvent): string | undefined {
+function useColor(): boolean {
+  return process.env.NO_COLOR !== "1" && process.env.NO_COLOR !== "true" && process.stdout.isTTY === true;
+}
+
+function color(code: string, text: string): string {
+  if (!useColor()) return text;
+  return `\x1b[${code}m${text}\x1b[0m`;
+}
+
+const styles = {
+  title: (text: string) => color("1;36", text),
+  label: (text: string) => color("1", text),
+  dim: (text: string) => color("2", text),
+  ok: (text: string) => color("32", text),
+  error: (text: string) => color("31", text),
+  tool: (text: string) => color("35", text),
+};
+
+function indent(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => (line ? `  ${line}` : line))
+    .join("\n");
+}
+
+function compact(value: unknown, maxLength = 120): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function ensureAssistantBlock(renderState: TuiRenderState): string {
+  if (renderState.assistantOpen) return "";
+  renderState.assistantOpen = true;
+  return `${styles.label("Agent")}\n  `;
+}
+
+function closeAssistantBlock(renderState: TuiRenderState): string {
+  if (!renderState.assistantOpen) return "";
+  renderState.assistantOpen = false;
+  return "\n";
+}
+
+function renderProviderEvent(event: StreamEvent, renderState: TuiRenderState): string | undefined {
+  if (event.type === "text_delta") {
+    renderState.streamedText += event.delta;
+    return `${ensureAssistantBlock(renderState)}${event.delta.replace(/\n/g, "\n  ")}`;
+  }
+  return undefined;
+}
+
+function renderEvent(event: AgentEvent, renderState: TuiRenderState): string | undefined {
+  if (event.type === "provider_event") {
+    return renderProviderEvent(event.event, renderState);
+  }
   if (event.type === "tool_start") {
-    return `tool: ${event.toolCall.name} started\n`;
+    return `${closeAssistantBlock(renderState)}${styles.label("Tools")}\n  ${styles.tool("[start]")} ${event.toolCall.name} ${styles.dim(compact(event.toolCall.arguments))}\n`;
   }
   if (event.type === "tool_end") {
-    return `tool: ${event.message.toolName} ${event.message.isError ? "error" : "ok"}\n`;
+    const status = event.message.isError ? styles.error("[error]") : styles.ok("[ok]");
+    const summary = compact(event.message.content.replace(/\s+/g, " "));
+    return `  ${status} ${event.message.toolName}${summary ? ` ${styles.dim(summary)}` : ""}\n`;
   }
   return undefined;
 }
@@ -166,11 +227,11 @@ export function parseTuiArgs(argv: readonly string[]): TuiCommand {
 }
 
 function writeHeader(io: CliIo, state: TuiState): void {
-  io.stdout.write("Simple Coding Agent TUI\n");
-  io.stdout.write(`cwd: ${state.cwd ?? process.cwd()}\n`);
-  io.stdout.write(`model: ${state.model ?? "deepseek-v4-pro"}\n`);
-  io.stdout.write(`thinking: ${state.thinking ? "on" : "off"}\n`);
-  io.stdout.write(`session: ${state.sessionPath ?? "(none)"}\n`);
+  io.stdout.write(`${styles.title("Simple Coding Agent")}\n`);
+  io.stdout.write(`${styles.dim("cwd")}      ${state.cwd ?? process.cwd()}\n`);
+  io.stdout.write(`${styles.dim("model")}    ${state.model ?? "deepseek-v4-pro"}\n`);
+  io.stdout.write(`${styles.dim("thinking")} ${state.thinking ? "on" : "off"}\n`);
+  io.stdout.write(`${styles.dim("session")}  ${state.sessionPath ?? "(none)"}\n\n`);
 }
 
 function commandFromState(prompt: string, state: TuiState): TuiRuntimeCommand {
@@ -192,11 +253,13 @@ async function runPromptTurn(
   runner: TuiPromptRunner,
   options: { signal?: AbortSignal } = {},
 ): Promise<{ code: number; message?: AssistantMessage }> {
-  io.stdout.write("status: running\n");
+  const renderState: TuiRenderState = { assistantOpen: false, streamedText: "" };
+  io.stdout.write(`${styles.label("You")}\n${indent(prompt)}\n\n`);
+  io.stdout.write(`${styles.dim("status")} running\n`);
   await appendSafeSessionMessage(state.sessionPath, { role: "user", content: prompt });
 
   const unsubscribe = runner.subscribe?.((event) => {
-    const line = renderEvent(event);
+    const line = renderEvent(event, renderState);
     if (line) io.stdout.write(line);
     return appendSafeSessionEvent(state.sessionPath, event);
   });
@@ -210,13 +273,18 @@ async function runPromptTurn(
   await appendSafeSessionMessage(state.sessionPath, message);
 
   if (message.stopReason === "error" || message.stopReason === "aborted") {
-    io.stdout.write(`status: ${message.stopReason}\n`);
+    io.stdout.write(closeAssistantBlock(renderState));
+    io.stdout.write(`${styles.dim("status")} ${message.stopReason === "error" ? styles.error("error") : "aborted"}\n`);
     io.stderr.write(`${message.errorMessage ?? (assistantText(message) || "Agent failed")}\n`);
     return { code: message.stopReason === "aborted" ? 130 : 1, message };
   }
 
-  io.stdout.write("status: done\n");
-  io.stdout.write(`assistant: ${assistantText(message)}\n`);
+  const finalText = assistantText(message);
+  if (renderState.streamedText.length === 0 && finalText) {
+    io.stdout.write(`${ensureAssistantBlock(renderState)}${finalText.replace(/\n/g, "\n  ")}`);
+  }
+  io.stdout.write(closeAssistantBlock(renderState));
+  io.stdout.write(`${styles.dim("status")} ${styles.ok("done")}\n\n`);
   return { code: 0, message };
 }
 
@@ -245,7 +313,7 @@ async function runOneShotTui(
 }
 
 function createRuntimeResetMessage(state: TuiState): string {
-  return `cwd: ${state.cwd ?? process.cwd()}\nmodel: ${state.model ?? "deepseek-v4-pro"}\nthinking: ${state.thinking ? "on" : "off"}\nsession: ${state.sessionPath ?? "(none)"}\n`;
+  return `${styles.dim("cwd")}      ${state.cwd ?? process.cwd()}\n${styles.dim("model")}    ${state.model ?? "deepseek-v4-pro"}\n${styles.dim("thinking")} ${state.thinking ? "on" : "off"}\n${styles.dim("session")}  ${state.sessionPath ?? "(none)"}\n`;
 }
 
 function parseOnOff(value: string | undefined): boolean | undefined {
@@ -268,7 +336,7 @@ async function runInteractiveCommand(
     return "continue";
   }
   if (name === "/clear") {
-    io.stdout.write("status: context cleared\n");
+    io.stdout.write(`${styles.dim("status")} context cleared\n`);
     return "reset";
   }
   if (name === "/cwd") {
@@ -305,7 +373,7 @@ async function runInteractiveCommand(
       return "continue";
     }
     state.sessionPath = value;
-    io.stdout.write(`session: ${state.sessionPath}\n`);
+    io.stdout.write(`${styles.dim("session")}  ${state.sessionPath}\n`);
     return "continue";
   }
 
@@ -368,7 +436,7 @@ async function runInteractiveTui(
       }
 
       turn += 1;
-      io.stdout.write(`turn: ${turn}\n`);
+      io.stdout.write(`\n${styles.label(`Turn ${turn}`)}\n`);
       runner ??= await createRuntime(commandFromState(prompt, state));
       const result = await runPromptTurn(prompt, state, io, runner, { signal: options.signal });
       if (result.code === 130) return 130;

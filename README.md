@@ -1,11 +1,11 @@
 # Simple Coding Agent
 
-Simple Coding Agent is a local-first TypeScript coding-agent MVP. It currently ships a runnable CLI and an interactive terminal UI. Both use the same agent loop, DeepSeek provider, and local file tools.
+Simple Coding Agent is a local-first TypeScript coding-agent MVP. It currently ships a runnable CLI and an interactive streaming terminal UI. Both use the same agent loop, DeepSeek provider, and local file tools.
 
 Status:
 
 - CLI MVP: available locally after build.
-- Interactive TUI: available locally after build.
+- Interactive streaming TUI: available locally after build.
 - npm publishing: not supported yet. This repository is GitHub-only for now.
 
 ## Requirements
@@ -89,6 +89,8 @@ Interactive commands:
 - `/model MODEL`
 - `/thinking on|off`
 - `/session PATH`
+
+The TUI renders each turn as readable `You`, `Agent`, `Tools`, and `status` blocks. Assistant text streams as provider deltas arrive; if a provider does not emit deltas, the TUI falls back to printing the final assistant message once.
 
 ## Local Safety
 

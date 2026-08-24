@@ -87,6 +87,6 @@ declare const process: {
   exitCode?: number;
   cwd(): string;
   stdin: unknown;
-  stdout: { write(chunk: string): void };
+  stdout: { write(chunk: string): void; isTTY?: boolean };
   stderr: { write(chunk: string): void };
 };
