@@ -10,7 +10,7 @@ packages/agent
   Agent loop, Agent class, event projection, and tool execution orchestration.
 
 packages/coding-agent
-  CLI, default coding tools, JSONL/print modes, session files, and runtime composition.
+  CLI, default coding tools, browser tools, workflow tools, JSONL/print modes, session files, and runtime composition.
 
 packages/tui
   Interactive terminal UI and one-shot terminal task mode over the coding-agent runtime.
@@ -31,5 +31,5 @@ ai <- agent <- coding-agent <- tui
 
 ```text
 CLI/TUI -> Agent -> Provider -> EventStream -> Agent events -> CLI/TUI output
-                 -> Tool registry -> local tool result -> next provider turn
+                 -> Tool registry -> local/browser/workflow result -> next provider turn
 ```

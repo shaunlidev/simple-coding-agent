@@ -293,6 +293,43 @@ test("interactive TUI session path records every prompt and assistant message", 
   assert.deepEqual(records.map((record) => record.version), [1, 1, 1, 1]);
 });
 
+test("interactive TUI workflow commands create specs, plans, and evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-workflow-"));
+  const { output, io } = createIo();
+  const input = createInput([
+    "/spec Browser Smoke | Verify browser tools can inspect a page | Navigates to a URL; Captures snapshot | 1",
+    "/backlog",
+    "/plan",
+    "/verify smoke | passed | Manual smoke passed | npm run test",
+    "/quit",
+  ]);
+
+  const code = await runTui(
+    ["--cwd", root],
+    io,
+    () => {
+      throw new Error("runtime should not initialize for workflow slash commands");
+    },
+    { input },
+  );
+
+  const backlog = JSON.parse(new TextDecoder().decode(await readFile(join(root, "docs/agent/backlog.json"))));
+  const requirementId = backlog.items[0].id;
+  const spec = new TextDecoder().decode(await readFile(join(root, "docs/agent/specs", `${requirementId}.md`)));
+  const plan = new TextDecoder().decode(await readFile(join(root, "docs/agent/plans/active", `${requirementId}.md`)));
+  const evidence = new TextDecoder().decode(await readFile(join(root, "docs/agent/evidence/smoke.md")));
+
+  assert.equal(code, 0);
+  assert.equal(output.stdout.includes("Workflow"), true);
+  assert.equal(output.stdout.includes("Captured requirement"), true);
+  assert.equal(output.stdout.includes("Browser Smoke"), true);
+  assert.equal(output.stdout.includes("Created plan"), true);
+  assert.equal(output.stdout.includes("Recorded verification smoke: passed"), true);
+  assert.equal(spec.includes("Captures snapshot"), true);
+  assert.equal(plan.includes("## Verification"), true);
+  assert.equal(evidence.includes("Manual smoke passed"), true);
+});
+
 test("TUI reports aborted runs distinctly", async () => {
   const { output, io } = createIo();
   const controller = new AbortController();

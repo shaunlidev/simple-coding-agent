@@ -2,12 +2,15 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { ToolDefinition } from "../../ai/dist/index.js";
+import { createBrowserTools, type BrowserAdapter } from "./browser-tools.js";
+import { createWorkflowTools } from "./workflow.js";
 
 export type ToolRuntimeOptions = {
   allowedRoot: string;
   maxReadBytes?: number;
   commandTimeoutMs?: number;
   env?: Record<string, string | undefined>;
+  browserAdapter?: BrowserAdapter;
 };
 
 export type ReadArgs = {
@@ -319,5 +322,7 @@ export function createLocalTools(runtime: ToolRuntimeOptions): ToolDefinition[] 
       },
       execute: (args, signal) => bashTool(args as BashArgs, runtime, signal as AbortSignal | undefined),
     },
+    ...createBrowserTools({ adapter: runtime.browserAdapter }),
+    ...createWorkflowTools({ allowedRoot: runtime.allowedRoot }),
   ];
 }

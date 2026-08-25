@@ -5,6 +5,10 @@ import {
   createDefaultRuntime,
   CliUsageError,
   SESSION_RECORD_VERSION,
+  workflowCaptureRequirement,
+  workflowCreatePlan,
+  workflowListBacklog,
+  workflowRecordVerification,
   type CliIo,
 } from "../../coding-agent/dist/index.js";
 
@@ -81,6 +85,12 @@ Interactive commands:
   /model MODEL     Change model and reset context
   /thinking on|off Toggle thinking and reset context
   /session PATH    Append future turns to a session JSONL file
+  /spec TITLE | DESCRIPTION | AC1; AC2 | PRIORITY
+                   Capture a requirement into docs/agent
+  /backlog         List ranked workflow backlog
+  /plan [ID]       Create an active implementation plan
+  /verify ID | passed|failed|blocked | SUMMARY | CMD1; CMD2
+                   Record verification evidence
 `;
 
 const INTERACTIVE_HELP = `Commands:
@@ -91,6 +101,10 @@ const INTERACTIVE_HELP = `Commands:
   /model MODEL
   /thinking on|off
   /session PATH
+  /spec TITLE | DESCRIPTION | AC1; AC2 | PRIORITY
+  /backlog
+  /plan [ID]
+  /verify ID | passed|failed|blocked | SUMMARY | CMD1; CMD2
 `;
 
 function assistantText(message: AssistantMessage): string {
@@ -227,7 +241,8 @@ export function parseTuiArgs(argv: readonly string[]): TuiCommand {
 }
 
 function writeHeader(io: CliIo, state: TuiState): void {
-  io.stdout.write(`${styles.title("Simple Coding Agent")}\n`);
+  io.stdout.write(`${styles.title("Simple Coding Agent Workbench")}\n`);
+  io.stdout.write(`${styles.dim("mode")}     code + workflow\n`);
   io.stdout.write(`${styles.dim("cwd")}      ${state.cwd ?? process.cwd()}\n`);
   io.stdout.write(`${styles.dim("model")}    ${state.model ?? "deepseek-v4-pro"}\n`);
   io.stdout.write(`${styles.dim("thinking")} ${state.thinking ? "on" : "off"}\n`);
@@ -322,6 +337,73 @@ function parseOnOff(value: string | undefined): boolean | undefined {
   return undefined;
 }
 
+function workflowRoot(state: TuiState): { allowedRoot: string } {
+  return { allowedRoot: state.cwd ?? process.cwd() };
+}
+
+function splitWorkflowArgs(value: string): string[] {
+  return value.split("|").map((part) => part.trim());
+}
+
+function splitList(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const items = value
+    .split(";")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return items.length === 0 ? undefined : items;
+}
+
+async function runWorkflowCommand(name: string, value: string, state: TuiState, io: CliIo): Promise<boolean> {
+  if (name === "/backlog") {
+    io.stdout.write(`${styles.label("Workflow")}\n${indent(await workflowListBacklog(workflowRoot(state)))}\n`);
+    return true;
+  }
+  if (name === "/spec") {
+    const [title, description, criteria, priority] = splitWorkflowArgs(value);
+    if (!title || !description) {
+      io.stderr.write("/spec requires TITLE | DESCRIPTION | AC1; AC2 | PRIORITY\n");
+      return true;
+    }
+    const result = await workflowCaptureRequirement(
+      {
+        title,
+        description,
+        acceptanceCriteria: splitList(criteria),
+        priority: priority ? Number(priority) : undefined,
+      },
+      workflowRoot(state),
+    );
+    io.stdout.write(`${styles.label("Workflow")}\n${indent(result)}\n`);
+    return true;
+  }
+  if (name === "/plan") {
+    const id = value.trim() || undefined;
+    const result = await workflowCreatePlan(id ? { id } : {}, workflowRoot(state));
+    io.stdout.write(`${styles.label("Workflow")}\n${indent(result)}\n`);
+    return true;
+  }
+  if (name === "/verify") {
+    const [id, result, summary, commands] = splitWorkflowArgs(value);
+    if (!id || !result || !summary) {
+      io.stderr.write("/verify requires ID | passed|failed|blocked | SUMMARY | CMD1; CMD2\n");
+      return true;
+    }
+    const recorded = await workflowRecordVerification(
+      {
+        id,
+        result: result as "passed" | "failed" | "blocked",
+        summary,
+        commands: splitList(commands),
+      },
+      workflowRoot(state),
+    );
+    io.stdout.write(`${styles.label("Workflow")}\n${indent(recorded)}\n`);
+    return true;
+  }
+  return false;
+}
+
 async function runInteractiveCommand(
   line: string,
   state: TuiState,
@@ -333,6 +415,9 @@ async function runInteractiveCommand(
   if (name === "/quit" || name === "/exit") return "quit";
   if (name === "/help") {
     io.stdout.write(INTERACTIVE_HELP);
+    return "continue";
+  }
+  if (await runWorkflowCommand(name, value, state, io)) {
     return "continue";
   }
   if (name === "/clear") {

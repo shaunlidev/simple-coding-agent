@@ -1,11 +1,13 @@
 # Simple Coding Agent
 
-Simple Coding Agent is a local-first TypeScript coding-agent MVP. It currently ships a runnable CLI and an interactive streaming terminal UI. Both use the same agent loop, DeepSeek provider, and local file tools.
+Simple Coding Agent is a local-first TypeScript coding-agent MVP. It currently ships a runnable CLI and an interactive streaming terminal UI. Both use the same agent loop, DeepSeek provider, local file tools, browser-tool hooks, and workflow tools.
 
 Status:
 
 - CLI MVP: available locally after build.
 - Interactive streaming TUI: available locally after build.
+- Browser tools: available when Playwright is installed locally.
+- Workflow tools: write requirements, backlog, plans, and verification evidence under `docs/agent/`.
 - npm publishing: not supported yet. This repository is GitHub-only for now.
 
 ## Requirements
@@ -89,8 +91,48 @@ Interactive commands:
 - `/model MODEL`
 - `/thinking on|off`
 - `/session PATH`
+- `/spec TITLE | DESCRIPTION | AC1; AC2 | PRIORITY`
+- `/backlog`
+- `/plan [ID]`
+- `/verify ID | passed|failed|blocked | SUMMARY | CMD1; CMD2`
 
 The TUI renders each turn as readable `You`, `Agent`, `Tools`, and `status` blocks. Assistant text streams as provider deltas arrive; if a provider does not emit deltas, the TUI falls back to printing the final assistant message once.
+
+## Browser Tools
+
+The agent exposes MCP-inspired browser tools:
+
+- `browser_navigate`
+- `browser_snapshot`
+- `browser_click`
+- `browser_type`
+- `browser_close`
+
+Install Playwright to use them with a real browser:
+
+```bash
+npm install -D playwright
+npx playwright install chromium
+```
+
+Without Playwright, browser tools fail clearly with installation guidance. Local tests use a fake browser adapter and do not require browser downloads.
+
+## Workflow Tools
+
+The agent can maintain local workflow artifacts:
+
+- `docs/agent/inbox.json`
+- `docs/agent/backlog.json`
+- `docs/agent/specs/*.md`
+- `docs/agent/plans/active/*.md`
+- `docs/agent/evidence/*.md`
+
+Available tools:
+
+- `workflow_capture_requirement`
+- `workflow_list_backlog`
+- `workflow_create_plan`
+- `workflow_record_verification`
 
 ## Local Safety
 

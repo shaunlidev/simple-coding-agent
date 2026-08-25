@@ -12,6 +12,30 @@ export {
 } from "./cli.js";
 
 export {
+  createBrowserTools,
+  createPlaywrightBrowserAdapter,
+  type BrowserAdapter,
+  type BrowserClickArgs,
+  type BrowserNavigateArgs,
+  type BrowserSnapshot,
+  type BrowserSnapshotArgs,
+  type BrowserTypeArgs,
+} from "./browser-tools.js";
+
+export {
+  createWorkflowTools,
+  workflowCaptureRequirement,
+  workflowCreatePlan,
+  workflowListBacklog,
+  workflowRecordVerification,
+  type BacklogRecord,
+  type RequirementRecord,
+  type WorkflowCaptureRequirementArgs,
+  type WorkflowCreatePlanArgs,
+  type WorkflowRecordVerificationArgs,
+} from "./workflow.js";
+
+export {
   bashTool,
   createLocalTools,
   editTool,
