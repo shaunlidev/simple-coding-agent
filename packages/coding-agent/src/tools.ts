@@ -219,9 +219,12 @@ export async function bashTool(args: BashArgs, runtime: ToolRuntimeOptions, sign
   const timeoutMs = args.timeoutMs ?? runtime.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const child = spawn(args.command, args.args ?? [], {
+  const env = scrubToolEnvironment(runtime.env ?? process.env);
+  const commandArgs = args.args ?? ["-lc", args.command];
+  const command = args.args ? args.command : env.SHELL ?? "/bin/sh";
+  const child = spawn(command, commandArgs, {
     cwd: await realpath(runtime.allowedRoot),
-    env: scrubToolEnvironment(runtime.env ?? process.env),
+    env,
     shell: false,
     signal: controller.signal,
   });

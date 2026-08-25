@@ -108,7 +108,7 @@ The agent exposes MCP-inspired browser tools:
 - `browser_type`
 - `browser_close`
 
-Install Playwright to use them with a real browser:
+Install Playwright to use them with a real browser. Browser navigation opens a headed Chromium window by default, unless the model passes `headless: true`.
 
 ```bash
 npm install -D playwright

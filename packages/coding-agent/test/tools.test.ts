@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -125,6 +125,16 @@ test("bash returns stdout, stderr, exit code, and timeout info", async () => {
   assert.equal(result.timedOut, false);
 });
 
+test("bash accepts shell-style command strings", async () => {
+  const root = await createRoot();
+
+  const result = await bashTool({ command: "echo hello && pwd" }, { allowedRoot: root });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, `hello\n${await realpath(root)}\n`);
+  assert.equal(result.stderr, "");
+});
+
 test("bash scrubs API keys and keeps ordinary execution working", async () => {
   const root = await createRoot();
 
@@ -145,6 +155,25 @@ test("bash scrubs API keys and keeps ordinary execution working", async () => {
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, "missing\ntrue\n");
+});
+
+test("bash scrubs API keys from shell-style command strings", async () => {
+  const root = await createRoot();
+
+  const result = await bashTool(
+    { command: "node -e \"console.log(process.env.DEEPSEEK_API_KEY || 'missing')\"" },
+    {
+      allowedRoot: root,
+      env: {
+        PATH: process.env.PATH,
+        SHELL: process.env.SHELL,
+        DEEPSEEK_API_KEY: "secret-value",
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "missing\n");
 });
 
 test("scrubToolEnvironment keeps safe names and drops common secret names", () => {

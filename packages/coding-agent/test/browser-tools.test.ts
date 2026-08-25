@@ -34,7 +34,7 @@ test("browser tools call the adapter in order", async () => {
     },
   };
 
-  assert.equal(await findTool("browser_navigate", adapter).execute?.({ url: "https://example.com", headless: false }), "navigated");
+  assert.equal(await findTool("browser_navigate", adapter).execute?.({ url: "https://example.com" }), "navigated");
   assert.deepEqual(await findTool("browser_snapshot", adapter).execute?.({ maxTextLength: 100 }), {
     url: "https://example.com",
     title: "Example",
@@ -46,7 +46,7 @@ test("browser tools call the adapter in order", async () => {
   assert.equal(await findTool("browser_close", adapter).execute?.({}), "closed");
 
   assert.deepEqual(calls, [
-    "navigate:https://example.com:false",
+    "navigate:https://example.com:undefined",
     "snapshot:100",
     "click:#go",
     "type:input:hello:true",

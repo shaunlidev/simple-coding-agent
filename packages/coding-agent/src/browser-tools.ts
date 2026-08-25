@@ -127,7 +127,7 @@ export function createPlaywrightBrowserAdapter(options: { loadPlaywright?: Playw
     async navigate(args, signal) {
       assertNotAborted(signal);
       const target = requireUrl(args.url);
-      const activePage = await ensurePage(args.headless ?? true);
+      const activePage = await ensurePage(args.headless ?? false);
       await activePage.goto(target);
       return `Navigated to ${target}`;
     },
