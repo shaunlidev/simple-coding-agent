@@ -1,6 +1,6 @@
 # 0009 Agent Ops 验收整改计划
 
-状态：用户已批准持续推进。R1 已验收并推送 `98501c5`，R2 已验收并推送 `f320f97`，均已核对远端 SHA。R3 验收通过，进入提交及确切提交复验/推送检查点，见 `docs/evidence/R3-run-consistency.md`；R4-R10 待开始。
+状态：用户已批准持续推进。R1 已验收并推送 `98501c5`，R2 已验收并推送 `f320f97`，R3 已验收并推送 `dd6be3b`，均已核对远端 SHA。R3 确切提交上的真实进程重启与浏览器验收通过。R4 执行中，见 `docs/evidence/R4-real-content-agent.md`；R5-R10 待开始。
 
 复核日期：2026-11-01。代码基线：`797ccb8`。
 
@@ -51,8 +51,8 @@
 | --- | --- | --- | --- | --- |
 | R1 | 干净环境可以安装、构建和启动 | 0、1、10 | package manifests、Docker、CI、README | 验收通过 |
 | R2 | 服务端权限、工具审批和网络限制生效 | 3、10 | security、server、工具执行入口 | 验收通过，已推送 |
-| R3 | run、内容、投递和事件状态一致 | 2、6 | db、runtime | 验收通过，待提交核对 |
-| R4 | Dashboard 运行真实 agent 与内容流程 | 3、6 | runtime、server、已有 ai/agent 组合 | 待开始 |
+| R3 | run、内容、投递和事件状态一致 | 2、6 | db、runtime | 验收通过，已推送 |
+| R4 | Dashboard 运行真实 agent 与内容流程 | 3、6 | runtime、server、已有 ai/agent 组合 | 实现与提交前验收通过，待确切 SHA 验证及推送 |
 | R5 | 定时、排队、取消和重启恢复正确 | 5 | runtime、server | 待开始 |
 | R6 | 偏好、检索和实践更新影响后续运行 | 7 | db、runtime、coding-agent、tui | 待开始 |
 | R7 | 指标、trace 和 heartbeat 来自实际运行 | 9、10 | runtime、server、ai 调用监测 | 待开始 |

@@ -36,7 +36,9 @@ CLI/TUI -> Agent -> Provider -> EventStream -> Agent events -> CLI/TUI output
 
 ## Agent Ops Boundaries
 
-`server` composes authentication, the guarded tool executor and the SQLite runtime. `runtime` depends on `db` and `security`; it does not depend on the server or dashboard. Shared network policy and redaction live in `security`. HTTP/RSS and read-only Chromium collection use the same validated transport. Chromium has a deny-only proxy for unhandled network channels; only the Node transport can make approved source requests. This is not a claim that arbitrary browser scripts or shell execution are safely sandboxed for multi-tenant use.
+`server` composes authentication, the guarded tool executor and the SQLite runtime. `runtime` depends on `db`, `security`, `agent` and `ai`; it does not depend on the server, dashboard or coding-agent tools. Shared network policy and redaction live in `security`. HTTP/RSS and read-only Chromium collection use the same validated transport. Chromium has a deny-only proxy for unhandled network channels; only the Node transport can make approved source requests. This is not a claim that arbitrary browser scripts or shell execution are safely sandboxed for multi-tenant use.
+
+Content tasks are versioned configuration; admission freezes a task snapshot. The content executor composes the existing Agent with only `collect_source(sourceId)`. Source outcomes and redacted, hashed text are immutable within a run and persisted before tool return. Final output uses exact quotes from those documents; completion rechecks citation membership against actual successful tool results inside the R3 transaction. An RSS article URL is not the feed URL that was read, and page anchors do not become read articles. Citation checks prove provenance, not semantic truth. Production Run now requires a configured task and never falls back to demo; `AGENT_DEMO_MODE=1` is an explicit fixture path.
 
 Persisted runtime events, memory/FTS, content, evaluations and audit records are redacted before insertion. Authentication session data is separate from user-visible business records. Server credentials never enter runtime/model inputs.
 

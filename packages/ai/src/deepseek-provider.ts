@@ -1,4 +1,5 @@
 import { createAssistantMessageEventStream } from "./assistant-message-event-stream.js";
+import { z } from "zod";
 import type {
   AssistantContent,
   AssistantMessage,
@@ -10,6 +11,7 @@ import type {
   StreamOptions,
   ToolCallContent,
   ToolDefinition,
+  Usage,
 } from "./types.js";
 
 export type DeepSeekProviderOptions = {
@@ -19,6 +21,9 @@ export type DeepSeekProviderOptions = {
   stream?: boolean;
   thinking?: boolean;
   toolChoice?: "auto" | "required" | "none";
+  maxOutputTokens?: number;
+  responseFormat?: "text" | "json_object";
+  maxResponseBytes?: number;
   fetch?: typeof fetch;
 };
 
@@ -43,35 +48,59 @@ type DeepSeekToolCall = {
   };
 };
 
-type DeepSeekChatResponse = {
-  choices: Array<{
-    finish_reason: string;
-    message: {
-      content?: string | null;
-      reasoning_content?: string | null;
-      tool_calls?: DeepSeekToolCall[];
-    };
-  }>;
-};
+const usageSchema = z.object({
+  prompt_tokens: z.number().int().nonnegative(),
+  completion_tokens: z.number().int().nonnegative(),
+  total_tokens: z.number().int().nonnegative(),
+  prompt_cache_hit_tokens: z.number().int().nonnegative().optional(),
+  prompt_cache_miss_tokens: z.number().int().nonnegative().optional(),
+}).refine((usage) => usage.total_tokens === usage.prompt_tokens + usage.completion_tokens, "usage totals are inconsistent");
+const toolCallSchema = z.object({
+  id: z.string().min(1), type: z.literal("function"),
+  function: z.object({ name: z.string().min(1), arguments: z.string() }),
+});
+const responseSchema = z.object({
+  model: z.string().optional(), usage: usageSchema.nullish(),
+  choices: z.array(z.object({
+    finish_reason: z.string(),
+    message: z.object({ content: z.string().nullish(), reasoning_content: z.string().nullish(), tool_calls: z.array(toolCallSchema).optional() }),
+  })).min(1),
+});
+const chunkSchema = z.object({
+  model: z.string().optional(), usage: usageSchema.nullish(),
+  choices: z.array(z.object({
+    finish_reason: z.string().nullish(),
+    delta: z.object({
+      content: z.string().nullish(), reasoning_content: z.string().nullish(),
+      tool_calls: z.array(z.object({
+        index: z.number().int().nonnegative(), id: z.string().optional(), type: z.literal("function").optional(),
+        function: z.object({ name: z.string().optional(), arguments: z.string().optional() }).optional(),
+      })).optional(),
+    }).optional(),
+  })),
+});
+type DeepSeekChatResponse = z.infer<typeof responseSchema>;
+type DeepSeekChunk = z.infer<typeof chunkSchema>;
 
-type DeepSeekChunk = {
-  choices?: Array<{
-    finish_reason?: string | null;
-    delta?: {
-      content?: string | null;
-      reasoning_content?: string | null;
-      tool_calls?: Array<{
-        index: number;
-        id?: string;
-        type?: "function";
-        function?: {
-          name?: string;
-          arguments?: string;
-        };
-      }>;
-    };
-  }>;
-};
+function toUsage(usage: z.infer<typeof usageSchema> | null | undefined): Usage | undefined {
+  if (!usage) return undefined;
+  return {
+    input: usage.prompt_tokens, output: usage.completion_tokens, totalTokens: usage.total_tokens,
+    ...(usage.prompt_cache_hit_tokens === undefined ? {} : { cacheReadInput: usage.prompt_cache_hit_tokens }),
+    ...(usage.prompt_cache_miss_tokens === undefined ? {} : { cacheWriteInput: usage.prompt_cache_miss_tokens }),
+  };
+}
+
+export class DeepSeekRequestError extends Error {
+  readonly retryable: boolean;
+  readonly code: string;
+  constructor(readonly status: number) {
+    super(`DeepSeek request failed with HTTP ${status}`);
+    this.name = "DeepSeekRequestError";
+    this.retryable = status === 408 || status === 429 || status >= 500;
+    this.code = `provider_http_${status}`;
+  }
+}
 
 function getApiKey(options: DeepSeekProviderOptions): string {
   const apiKey = options.apiKey ?? process.env.DEEPSEEK_API_KEY;
@@ -130,15 +159,11 @@ function toDeepSeekTools(tools: readonly ToolDefinition[] | undefined) {
 }
 
 function mapStopReason(finishReason: string): AssistantMessage["stopReason"] {
-  return finishReason === "tool_calls" ? "tool_call" : "stop";
+  return finishReason === "tool_calls" ? "tool_call" : finishReason === "stop" ? "stop" : "error";
 }
 
 function parseToolArguments(argsJson: string): JsonObject {
-  const parsed = JSON.parse(argsJson);
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("DeepSeek tool arguments must have a JSON object root");
-  }
-  return parsed as JsonObject;
+  return z.record(z.string(), z.json()).parse(JSON.parse(argsJson));
 }
 
 function pushText(stream: ReturnType<typeof createAssistantMessageEventStream>, contentIndex: number, text: string): void {
@@ -179,6 +204,7 @@ function pushToolCall(
 function produceFromMessage(
   stream: ReturnType<typeof createAssistantMessageEventStream>,
   response: DeepSeekChatResponse,
+  model: string,
 ): void {
   const choice = response.choices[0];
   if (!choice) {
@@ -210,12 +236,20 @@ function produceFromMessage(
     contentIndex += 1;
   }
 
-  const stopReason = mapStopReason(choice.finish_reason);
-  stream.push({
-    type: "done",
-    reason: stopReason,
-    message: { role: "assistant", stopReason, content },
-  });
+  pushCompletion(stream, { content, finishReason: choice.finish_reason, model: response.model ?? model, usage: toUsage(response.usage) });
+}
+
+function pushCompletion(stream: ReturnType<typeof createAssistantMessageEventStream>, options: {
+  content: AssistantContent[]; finishReason: string; model: string; usage: Usage | undefined;
+}): void {
+  const stopReason = mapStopReason(options.finishReason);
+  const message: AssistantMessage = {
+    role: "assistant", stopReason, content: options.content, provider: "deepseek", model: options.model,
+    timestamp: Date.now(), ...(options.usage ? { usage: options.usage } : {}),
+    ...(stopReason === "error" ? { errorMessage: `DeepSeek completion failed: ${options.finishReason}`, errorCode: `provider_finish_${options.finishReason}`, retryable: options.finishReason === "insufficient_system_resource" } : {}),
+  };
+  if (stopReason === "error") stream.push({ type: "error", reason: "error", message });
+  else stream.push({ type: "done", reason: stopReason, message });
 }
 
 type StreamingToolState = {
@@ -232,7 +266,7 @@ function parseSseEvent(text: string): DeepSeekChunk[] {
     if (!line.startsWith("data:")) continue;
     const data = line.slice("data:".length).trim();
     if (!data || data === "[DONE]") continue;
-    chunks.push(JSON.parse(data));
+    chunks.push(chunkSchema.parse(JSON.parse(data)));
   }
   return chunks;
 }
@@ -246,7 +280,7 @@ function findSseBoundary(buffer: string): { index: number; length: number } | un
   return lf < crlf ? { index: lf, length: 2 } : { index: crlf, length: 4 };
 }
 
-function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessageEventStream>) {
+function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessageEventStream>, initialModel: string) {
   const content: AssistantContent[] = [];
   const tools = new Map<number, StreamingToolState>();
   let textIndex: number | undefined;
@@ -254,9 +288,13 @@ function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessa
   let thinkingIndex: number | undefined;
   let thinking = "";
   let nextContentIndex = 0;
-  let finishReason = "stop";
+  let finishReason: string | undefined;
+  let usage: Usage | undefined;
+  let model = initialModel;
 
   function accept(chunk: DeepSeekChunk): void {
+    if (chunk.usage) usage = toUsage(chunk.usage);
+    if (chunk.model) model = chunk.model;
     const choice = chunk.choices?.[0];
     if (!choice) return;
     const delta = choice.delta ?? {};
@@ -278,6 +316,7 @@ function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessa
         thinkingIndex = undefined;
       }
       if (textIndex === undefined) {
+        text = "";
         textIndex = nextContentIndex;
         nextContentIndex += 1;
         stream.push({ type: "text_start", contentIndex: textIndex });
@@ -334,7 +373,7 @@ function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessa
     }
   }
 
-  function finish(): void {
+  function finish(sawDone: boolean): void {
     if (thinkingIndex !== undefined) {
       stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinking });
       content.push({ type: "thinking", thinking });
@@ -342,6 +381,12 @@ function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessa
     if (textIndex !== undefined) {
       stream.push({ type: "text_end", contentIndex: textIndex, content: text });
       content.push({ type: "text", text });
+    }
+    const reason = sawDone && finishReason ? finishReason : "incomplete/truncated stream";
+    // Partial tool JSON is not executable, but its billed usage still belongs to the failed response.
+    if (mapStopReason(reason) === "error") {
+      pushCompletion(stream, { content, model, usage, finishReason: reason });
+      return;
     }
     for (const tool of [...tools.values()].sort((left, right) => left.contentIndex - right.contentIndex)) {
       const block: ToolCallContent = {
@@ -354,8 +399,7 @@ function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessa
       content.push(block);
     }
 
-    const stopReason = mapStopReason(finishReason);
-    stream.push({ type: "done", reason: stopReason, message: { role: "assistant", stopReason, content } });
+    pushCompletion(stream, { content, model, usage, finishReason: reason });
   }
 
   return { accept, finish };
@@ -364,44 +408,57 @@ function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessa
 async function produceFromStreamingResponse(
   stream: ReturnType<typeof createAssistantMessageEventStream>,
   response: Response,
+  model: string,
+  maxResponseBytes: number,
 ): Promise<void> {
   stream.push({ type: "start" });
-  const assembler = createStreamingAssembler(stream);
-  const body = response.body;
-  if (!body) {
-    assembler.finish();
-    return;
+  const assembler = createStreamingAssembler(stream, model);
+  let buffer = "";
+  let sawDone = false;
+  function acceptEvent(eventText: string): void {
+    if (sawDone && eventText.trim()) throw new Error("DeepSeek stream contains data after DONE");
+    sawDone = eventText.split(/\r?\n/).some((line) => line.trim() === "data: [DONE]");
+    for (const chunk of parseSseEvent(eventText)) assembler.accept(chunk);
   }
 
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  for await (const text of readBoundedBody(response, maxResponseBytes)) {
+    buffer += text;
     let boundary = findSseBoundary(buffer);
     while (boundary) {
       const eventText = buffer.slice(0, boundary.index);
       buffer = buffer.slice(boundary.index + boundary.length);
-      for (const chunk of parseSseEvent(eventText)) {
-        assembler.accept(chunk);
-      }
+      acceptEvent(eventText);
       boundary = findSseBoundary(buffer);
     }
   }
 
-  buffer += decoder.decode();
-  if (buffer.trim()) {
-    for (const chunk of parseSseEvent(buffer)) {
-      assembler.accept(chunk);
+  if (buffer.trim()) acceptEvent(buffer);
+  assembler.finish(sawDone);
+}
+
+async function* readBoundedBody(response: Response, maxBytes: number): AsyncGenerator<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return;
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) throw new Error(`DeepSeek response exceeded byte limit ${maxBytes}`);
+      yield decoder.decode(value, { stream: true });
     }
+    yield decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
-  assembler.finish();
 }
 
 export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): Provider {
+  const maxResponseBytes = z.number().int().min(1).max(8 * 1024 * 1024).parse(options.maxResponseBytes ?? 2 * 1024 * 1024);
+  if (options.maxOutputTokens !== undefined) z.number().int().min(1).max(393216).parse(options.maxOutputTokens);
   const model: Model = {
     ...DEEPSEEK_MODEL,
     id: options.model ?? DEEPSEEK_MODEL.id,
@@ -424,27 +481,37 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): P
             messages: toChatMessages(context),
             tools: toDeepSeekTools(context.tools),
             stream: options.stream === true,
+            ...(options.stream === true ? { stream_options: { include_usage: true } } : {}),
+            ...(options.maxOutputTokens === undefined ? {} : { max_tokens: options.maxOutputTokens }),
+            ...(options.responseFormat ? { response_format: { type: options.responseFormat } } : {}),
             ...(options.thinking === true ? {} : { thinking: { type: "disabled" } }),
             ...(toolChoice ? { tool_choice: toolChoice } : {}),
           };
+          const apiKey = getApiKey(options);
           const response = await doFetch(`${baseUrl}/chat/completions`, {
             method: "POST",
             headers: {
               "content-type": "application/json",
-              authorization: `Bearer ${getApiKey(options)}`,
+              authorization: `Bearer ${apiKey}`,
             },
             body: JSON.stringify(body),
             signal: streamOptions?.signal,
+          }).catch((error: unknown) => {
+            if (streamOptions?.signal?.aborted) throw error;
+            throw Object.assign(new Error("DeepSeek transport request failed"), { code: "provider_transport", retryable: true });
           });
 
           if (!response.ok) {
-            throw new Error(`DeepSeek request failed with HTTP ${response.status}: ${await response.text()}`);
+            await response.body?.cancel();
+            throw new DeepSeekRequestError(response.status);
           }
 
           if (options.stream === true) {
-            await produceFromStreamingResponse(stream, response);
+            await produceFromStreamingResponse(stream, response, model.id, maxResponseBytes);
           } else {
-            produceFromMessage(stream, (await response.json()) as DeepSeekChatResponse);
+            let text = "";
+            for await (const chunk of readBoundedBody(response, maxResponseBytes)) text += chunk;
+            produceFromMessage(stream, responseSchema.parse(JSON.parse(text)), model.id);
           }
         })().catch((error) => {
           stream.fail(error);

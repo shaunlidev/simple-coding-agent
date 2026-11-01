@@ -35,6 +35,8 @@ export type Usage = {
   input: number;
   output: number;
   totalTokens: number;
+  cacheReadInput?: number;
+  cacheWriteInput?: number;
 };
 
 export type AssistantMessage = {
@@ -46,6 +48,8 @@ export type AssistantMessage = {
   timestamp?: number;
   usage?: Usage;
   errorMessage?: string;
+  errorCode?: string;
+  retryable?: boolean;
 };
 
 export type UserMessage = {

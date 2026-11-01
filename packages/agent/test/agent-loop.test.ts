@@ -162,6 +162,21 @@ test("max-turn guard prevents infinite tool loops", async () => {
   await assert.rejects(resultPromise, /exceeded maxTurns 1/);
 });
 
+test("tool-call budget bounds one multi-call response and prevents further side effects", async () => {
+  let calls = 0;
+  const handle = createFauxProvider({ responses: [{ type: "success", content: [
+    { type: "tool_call", id: "a", name: "read", arguments: { path: "a" } },
+    { type: "tool_call", id: "b", name: "read", arguments: { path: "b" } },
+  ] }, "should not run"] });
+  const stream = runAgentLoop("bounded", { provider: handle.provider, maxToolCalls: 1, tools: [{ ...readTool, execute: () => { calls++; return "read"; } }] });
+  const result = stream.result();
+  const drain = (async () => { for await (const _ of stream) {} })();
+  await assert.rejects(drain, /maxToolCalls 1/);
+  await assert.rejects(result, /maxToolCalls 1/);
+  assert.equal(calls, 1);
+  assert.equal(handle.pendingResponses(), 1);
+});
+
 test("provider async failure becomes a clean assistant error and agent_end", async () => {
   const provider: Provider = {
     id: "broken",

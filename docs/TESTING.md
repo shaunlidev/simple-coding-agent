@@ -49,6 +49,15 @@ These use isolated SQLite, synthetic secrets and actual Chromium. The browser se
 
 ## Coverage
 
+R4 after building:
+
+```bash
+node scripts/verify-content-agent.mjs
+RUN_DEEPSEEK_LIVE=1 node --env-file-if-exists=.env scripts/verify-content-live.mjs
+```
+
+The first gate uses controlled provider/transport responses but the actual Dashboard/API/SQLite and Chromium source adapter. The second uses real DeepSeek, public RSS and Chromium; it is bounded to three provider turns and returns exit 2 (not success) when credentials/opt-in are absent. Set `AGENT_DNS_MODE=cloudflare` explicitly only when the system resolver produces fake/private source addresses; the first failed attempt remains evidence. Reports under `artifacts/acceptance/R4/` distinguish fixture/live runs and record SHA plus dirty state. Exact citation checks prove textual provenance, not semantic entailment.
+
 R3 consistency verification after building the API and dashboard:
 
 ```bash

@@ -9,7 +9,7 @@ Status:
 - Browser tools: available when Playwright is installed locally.
 - Workflow tools: write requirements, backlog, plans, and verification evidence under `docs/agent/`.
 - Scheduled content tasks: local scheduler, event log, memory/preferences, content pipeline, digest delivery, and feedback loop.
-- Agent Ops Dashboard: Fastify/React/SQLite control plane under acceptance repair. Its current content run is a demo until the real execution gate is completed.
+- Agent Ops Dashboard: Fastify/React/SQLite control plane with real DeepSeek content runs and cited RSS/web/browser observations. Production acceptance remains in progress.
 - npm publishing: not supported yet. This repository is GitHub-only for now.
 
 ## Requirements
@@ -207,9 +207,15 @@ Operators can run tasks and change state; viewers can read the workspace. Sessio
 
 Memory clearing now requires a server-recorded approval. Request `/api/security/approvals` with `{runId, tool: "memory_clear", args: {confirmation: "clear-memory"}}`, approve its ID through `/api/security/approvals/:id/approve`, then execute the bound operation once. These are authenticated operator requests with CSRF. A policy check is informational and never creates an execution approval. Full approval controls in the dashboard are part of R8.
 
-R2 security gates now cover authenticated API/SSE/export, bound single-use approvals, validated and pinned outbound HTTP, browser subrequest restrictions, and redaction before new persistence/log writes. See [R2 evidence](docs/evidence/R2-security-boundaries.md) for results and residual risks. This does not scrub historical databases or provide a multi-tenant execution sandbox. R3-R10 and cloud release acceptance remain open; do not expose this branch as a production service.
+R2 security gates cover authenticated API/SSE/export, bound single-use approvals, validated and pinned outbound HTTP, browser subrequest restrictions, and redaction before new persistence/log writes. See [R2 evidence](docs/evidence/R2-security-boundaries.md) for results and residual risks. This does not scrub historical databases or provide a multi-tenant execution sandbox. R5-R10 and cloud release acceptance remain open; do not expose this branch as a production service.
 
-Run now currently uses a labeled demo executor; real Dashboard provider/source execution is the next R4 gate. Runtime history now keeps each run's result and returns `no_new_items` when there is nothing new to deliver. The Runs selector can inspect older results. Manual-run API clients should retain one `Idempotency-Key` per intended action across transport retries; reusing it for another target returns 409. A new intentional run uses a new key. The UI retains the key after a request error.
+Run now requires a configured task and a working DeepSeek key. Add source origins to `AGENT_URL_ALLOWLIST`, restart the API, then select **New task**, enter a research request and RSS/web/browser URL, and create the task. Select it and choose **Run now**. Run history exposes tool requests, returned documents, model usage and cited results. A missing key, unavailable source or invalid citation fails explicitly; no automatic demo fallback exists. `AGENT_DEMO_MODE=1` explicitly opts into the old fixture executor for demonstrations and tests only.
+
+The API supports up to four sources and bounded task limits via `PUT /api/tasks/:id` with `{definition, expectedRevision}`; the current minimal form creates single-source tasks. Full editing/navigation is R8. Admission freezes the configuration. Existing schedules without a bound task are paused by migration and must be configured before enabling. Scheduling cancellation and recovery remain R5 work.
+
+Runtime history keeps each run's result and returns `no_new_items` when there is nothing new to deliver. Manual-run API clients send `{taskId}` and retain one `Idempotency-Key` per intended action across transport retries; reusing it for another target returns 409. A new intentional run uses a new key. The UI retains the key after a request error.
+
+Network resolution defaults to the system DNS. Some local VPNs return fake addresses in `198.18.0.0/15`; those remain denied. For that environment, explicitly set `AGENT_DNS_MODE=cloudflare` to use Cloudflare's fixed HTTPS resolver. DNS queries then go to Cloudflare; source origin allowlists, rejection of all private/reserved answers, redirects and pinned connections remain enforced. This is not a setting to permit internal URLs. Do not change host DNS or allow private ranges to pass a test.
 
 Database migrations are versioned and transactional. Back up an existing SQLite database before upgrading. Surviving legacy rows are imported, but old outputs already discarded by the previous schema cannot be reconstructed; those receipts are marked `legacy_incomplete`. Reads and readiness checks no longer create demo runs. `db:seed` explicitly creates demo data; skip that command for an empty workspace.
 
@@ -217,8 +223,9 @@ Initialize the local database:
 
 ```bash
 npm run db:migrate
-npm run db:seed
 ```
+
+`npm run db:seed` is optional and creates labeled demo history; it is not needed for real tasks.
 
 Run the API:
 
@@ -317,7 +324,7 @@ RUN_BROWSER_LIVE=1 npm run test:live
 
 - `DEEPSEEK_API_KEY is required`: export the key in the same shell command or source your `.env` with your preferred shell tooling.
 - `Cannot find module .../dist/...`: run `npm run build`.
-- Unsupported Node behavior: check `node --version`; this repo expects Node.js 22.19+.
+- Unsupported Node behavior: use the pinned Node.js 22.23.4. Parser dependencies require Node 22.22.2+, 24.15.0+, or 26+ within those supported major ranges.
 
 ## Publishing
 

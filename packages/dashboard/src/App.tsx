@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchRun, fetchRuns, fetchSnapshot, patchSchedule, runNow, type DeliveredContentItem, type EvalGate, type RuntimeEvent, type RuntimeSchedule, type RuntimeSnapshot, type RuntimeSpan, type RuntimeStep } from "./api.js";
+import { fetchTasks } from "./api.js";
+import { TaskConfig } from "./TaskConfig.js";
 
 const snapshotKey = ["runtime-snapshot"] as const;
 
@@ -60,7 +62,7 @@ function MetricTile(props: { label: string; value: string; detail: string; tone?
   );
 }
 
-function Cockpit(props: { snapshot: RuntimeSnapshot; onRunNow: () => void; isRunning: boolean; canOperate: boolean }) {
+function Cockpit(props: { snapshot: RuntimeSnapshot; onRunNow: () => void; isRunning: boolean; canOperate: boolean; taskSelector: React.ReactNode; hasTask: boolean }) {
   const run = props.snapshot.latestRun;
   return (
     <section className="cockpit">
@@ -74,7 +76,8 @@ function Cockpit(props: { snapshot: RuntimeSnapshot; onRunNow: () => void; isRun
         </div>
       </div>
       <div className="cockpitControls">
-        <button className="primaryButton" onClick={props.onRunNow} disabled={props.isRunning || !props.canOperate} title={props.canOperate ? undefined : "Operator permission required"}>
+        {props.taskSelector}
+        <button className="primaryButton" onClick={props.onRunNow} disabled={props.isRunning || !props.canOperate || !props.hasTask} title={props.canOperate ? undefined : "Operator permission required"}>
           {props.isRunning ? "Starting..." : "Run now"}
         </button>
         <div className="runSummary">
@@ -172,10 +175,11 @@ function ContentPipeline(props: { snapshot: RuntimeSnapshot }) {
 }
 
 function ContentItem(props: { item: DeliveredContentItem }) {
+  const sourceUrl = props.item.url && /^https?:\/\//i.test(props.item.url) ? props.item.url : undefined;
   return (
     <article className="contentItem">
       <div className="contentItemHeader">
-        <strong>{props.item.title}</strong>
+        <strong>{sourceUrl ? <a href={sourceUrl} target="_blank" rel="noopener noreferrer">{props.item.title}</a> : props.item.title}</strong>
         <span className={`statusPill ${statusClass(props.item.status)}`}>{props.item.status}</span>
       </div>
       <p>{props.item.summary}</p>
@@ -345,6 +349,10 @@ function RunHistory() {
       {detail.data.result?.outcome === "no_new_items" ? <p role="status">No new items</p> : null}
       {detail.data.result?.outcome === "legacy_incomplete" ? <p role="status">Legacy results may be incomplete.</p> : null}
       {detail.data.result?.items.map((item) => <ContentItem key={item.id} item={item} />)}
+      {detail.data.events.filter((event) => ["agent.tool.started", "agent.tool.completed", "agent.model.completed", "run.failed"].includes(event.type)).map((event) => <details key={event.id} className="executionDetail">
+        <summary>{event.type === "agent.tool.started" ? `Tool call: ${String(event.payload.tool)}` : event.type === "agent.tool.completed" ? `Tool result: ${String(event.payload.tool)}` : event.type === "agent.model.completed" ? `Model: ${String(event.payload.model)} (${String(event.payload.status)})` : "Run failure"}</summary>
+        <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+      </details>)}
     </div> : null}
   </div>;
 }
@@ -352,9 +360,12 @@ function RunHistory() {
 export function App({ canOperate }: { canOperate: boolean }) {
   const queryClient = useQueryClient();
   const pendingRunKey = useRef<string | undefined>(undefined);
+  const [selectedTask, setSelectedTask] = useState("");
+  const tasks = useQuery({ queryKey: ["content-tasks"], queryFn: fetchTasks });
+  const taskId = selectedTask || tasks.data?.tasks[0]?.definition.id;
   const snapshot = useQuery<RuntimeSnapshot, Error>({ queryKey: snapshotKey, queryFn: fetchSnapshot, refetchInterval: 10_000 });
   const runNowMutation = useMutation({
-    mutationFn: () => runNow(pendingRunKey.current ??= crypto.randomUUID()),
+    mutationFn: () => runNow(pendingRunKey.current ??= crypto.randomUUID(), taskId),
     onSuccess: async () => {
       pendingRunKey.current = undefined;
       await queryClient.invalidateQueries({ queryKey: snapshotKey });
@@ -414,7 +425,14 @@ export function App({ canOperate }: { canOperate: boolean }) {
 
   return (
     <main className="shell">
-      <Cockpit snapshot={data} onRunNow={() => runNowMutation.mutate()} isRunning={runNowMutation.isPending} canOperate={canOperate} />
+      <Cockpit snapshot={data} onRunNow={() => runNowMutation.mutate()} isRunning={runNowMutation.isPending} canOperate={canOperate} hasTask={Boolean(taskId || tasks.data?.demoMode)} taskSelector={
+        <label className="taskSelector">Task<select aria-label="Task" value={taskId ?? ""} onChange={(event) => { setSelectedTask(event.target.value); pendingRunKey.current = undefined; }}>
+          {!tasks.data?.tasks.length ? <option value="">{tasks.data?.demoMode ? "Explicit demo" : "No configured tasks"}</option> : null}
+          {tasks.data?.tasks.map((task) => <option key={task.definition.id} value={task.definition.id}>{task.definition.title}</option>)}
+        </select></label>
+      } />
+      <TaskConfig defaultModel={tasks.data?.defaultModel ?? "deepseek-v4-pro"} canOperate={canOperate} onCreated={(id) => { setSelectedTask(id); pendingRunKey.current = undefined; }} />
+      {tasks.isError ? <p role="alert">Task configuration unavailable: {tasks.error.message}</p> : null}
       {runNowMutation.isError ? <div className="alert">Run now failed: {runNowMutation.error.message}</div> : null}
       {scheduleMutation.isError ? <div className="alert">Schedule update failed: {scheduleMutation.error.message}</div> : null}
 

@@ -3,6 +3,7 @@ import type { LookupAddress } from "node:dns";
 import type { LookupFunction } from "node:net";
 import ipaddr from "ipaddr.js";
 import { Agent, fetch } from "undici";
+import { z } from "zod";
 
 export type NetworkDocument = {
   url: string;
@@ -16,7 +17,7 @@ type NetworkOptions = {
   timeoutMs?: number;
   maxBytes?: number;
   maxRedirects?: number;
-  resolve?: (hostname: string) => Promise<LookupAddress[]>;
+  resolve?: (hostname: string, signal?: AbortSignal) => Promise<LookupAddress[]>;
   transport?: typeof pinnedRequest;
 };
 
@@ -94,7 +95,7 @@ export class SafeNetwork {
     const literal = ipaddr.isValid(hostname);
     const resolving = literal
       ? Promise.resolve([{ address: hostname, family: ipaddr.parse(hostname).kind() === "ipv4" ? 4 : 6 }])
-      : (this.options.resolve ?? ((host) => lookup(host, { all: true })))(hostname);
+      : (this.options.resolve ?? ((host) => lookup(host, { all: true })))(hostname, signal);
     const addresses = await abortable(resolving, signal ?? AbortSignal.timeout(this.options.timeoutMs ?? 10_000));
     const address = addresses[0];
     if (!address || addresses.some((candidate) => !isPublicAddress(candidate.address))) throw new Error("Network policy: private or reserved destination denied");
@@ -119,4 +120,47 @@ export class SafeNetwork {
     }
     throw new Error("Network policy: redirect limit exceeded");
   }
+}
+
+const dnsAnswerSchema = z.object({
+  Status: z.literal(0), TC: z.literal(false),
+  Question: z.array(z.object({ name: z.string(), type: z.number() })).length(1),
+  Answer: z.array(z.object({ type: z.number(), data: z.string() })).default([]),
+});
+
+// Explicit server-selected control-plane endpoint, never an arbitrary URL supplied by a model or page.
+export function createCloudflareResolver(request: typeof globalThis.fetch = globalThis.fetch) {
+  return async (hostname: string, upstream?: AbortSignal): Promise<LookupAddress[]> => {
+    const addresses: LookupAddress[] = [];
+    for (const type of [1, 28]) {
+      const signal = AbortSignal.any([AbortSignal.timeout(5000), ...(upstream ? [upstream] : [])]);
+      const url = new URL("https://cloudflare-dns.com/dns-query");
+      url.searchParams.set("name", hostname);
+      url.searchParams.set("type", String(type));
+      const response = await request(url, { headers: { accept: "application/dns-json" }, redirect: "error", signal });
+      if (!response.ok) { await response.body?.cancel(); throw new Error("Trusted DNS resolver unavailable"); }
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Trusted DNS resolver returned no data");
+      let size = 0;
+      let body = "";
+      const decoder = new TextDecoder();
+      try {
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          size += chunk.value.byteLength;
+          if (size > 64 * 1024) throw new Error("DNS response exceeds byte limit");
+          body += decoder.decode(chunk.value, { stream: true });
+        }
+        body += decoder.decode();
+      } finally { await reader.cancel(); reader.releaseLock(); }
+      const result = dnsAnswerSchema.parse(JSON.parse(body));
+      const question = result.Question[0];
+      if (question.name.replace(/\.$/, "").toLowerCase() !== hostname.toLowerCase() || question.type !== type) throw new Error("DNS response question mismatch");
+      for (const answer of result.Answer) {
+        if (answer.type === type) addresses.push({ address: answer.data, family: type === 1 ? 4 : 6 });
+      }
+    }
+    return addresses;
+  };
 }

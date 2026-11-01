@@ -6,6 +6,7 @@ export const operatorSecret = "test-operator-credential-with-32-bytes";
 export const viewerSecret = "test-viewer-credential-with-32-bytes";
 export const authEnv = {
   AGENT_DB_PATH: ":memory:",
+  AGENT_DEMO_MODE: "1",
   AGENT_SESSION_SECRET: "test-session-signing-secret-with-32-bytes",
   AGENT_AUTH_USERS: JSON.stringify([
     { id: "owner", role: "operator", secret: operatorSecret },

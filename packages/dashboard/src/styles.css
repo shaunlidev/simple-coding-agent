@@ -42,6 +42,17 @@ button:disabled {
   opacity: 0.62;
 }
 
+.taskSelector, .taskConfig label { display: grid; gap: 6px; min-width: 0; font-size: 14px; }
+.taskSelector select, .taskConfig input, .taskConfig textarea, .taskConfig select { width: 100%; min-width: 0; padding: 10px; border: 1px solid #64736a; border-radius: 4px; background: white; color: #17211d; }
+.taskConfig { padding: 16px 0; border-bottom: 1px solid #ced8cf; }
+.taskConfig > button { min-height: 40px; padding: 8px 16px; border: 1px solid #64736a; border-radius: 4px; color: #17211d; background: white; }
+.taskConfig form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 16px; padding: 16px 0; }
+.taskConfig p { overflow-wrap: anywhere; color: #7d211f; }
+.executionDetail { min-width: 0; border-top: 1px solid #ced8cf; padding: 10px 0; }
+.executionDetail summary { overflow-wrap: anywhere; cursor: pointer; }
+.executionDetail pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow-y: auto; font-size: 12px; }
+@media (max-width: 600px) { .taskConfig form { grid-template-columns: minmax(0, 1fr); } }
+
 .shell {
   width: min(1440px, 100%);
   margin: 0 auto;

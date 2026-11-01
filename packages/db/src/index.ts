@@ -65,6 +65,7 @@ export const schedules = sqliteTable("schedules", {
   nextRunAt: text("next_run_at"),
   lastRunAt: text("last_run_at"),
   overlapPolicy: text("overlap_policy").notNull(),
+  taskId: text("task_id"),
 });
 
 export const memoryEntries = sqliteTable("memory_entries", {
@@ -98,6 +99,7 @@ export const runContentResults = sqliteTable("run_content_results", {
   summary: text("summary").notNull(),
   reason: text("reason").notNull(),
   evidenceJson: text("evidence_json").notNull().default("[]"),
+  citationsJson: text("citations_json").notNull().default("[]"),
   score: real("score").notNull(),
   status: text("status").notNull(),
   createdAt: text("created_at").notNull(),
@@ -249,6 +251,15 @@ export function createSqliteDatabase(path = ":memory:"): SqliteDatabase {
   };
 }
 
+const contentTaskSchema = [
+  "create table content_tasks (id text primary key, revision integer not null, definition_json text not null, updated_at text not null)",
+  "create table run_task_snapshots (run_id text primary key, revision integer not null, definition_json text not null)",
+  "create table run_source_reads (run_id text not null references run_task_snapshots(run_id), source_id text not null, result_json text not null, primary key(run_id, source_id))",
+  "alter table schedules add column task_id text references content_tasks(id)",
+  "update schedules set enabled = 0 where task_id is null",
+  "alter table run_content_results add column citations_json text not null default '[]'",
+];
+
 export function migrateSqliteDatabase(database: SqliteDatabase): void {
   const { sqlite } = database;
   const migrations = [
@@ -260,6 +271,9 @@ export function migrateSqliteDatabase(database: SqliteDatabase): void {
     { version: 2, name: "run-content-consistency-v1", statements: consistencySchema, apply: () => {
       for (const statement of consistencySchema) sqlite.exec(statement);
       importLegacyContent(database);
+    } },
+    { version: 3, name: "content-task-evidence-v1", statements: contentTaskSchema, apply: () => {
+      for (const statement of contentTaskSchema) sqlite.exec(statement);
     } },
   ];
   sqlite.transaction(() => {

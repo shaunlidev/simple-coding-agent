@@ -25,7 +25,7 @@ const logs = [];
 async function start() {
   child = spawn(process.execPath, ["packages/server/dist/entry.js"], {
     env: { PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: "test", AGENT_DB_PATH: databasePath, AGENT_SERVER_HOST: "127.0.0.1", AGENT_SERVER_PORT: String(port), AGENT_PUBLIC_ORIGIN: origin, AGENT_CORS_ORIGIN: origin,
-      AGENT_SESSION_SECRET: "synthetic-r3-session-signing-secret-32-bytes", AGENT_AUTH_USERS: JSON.stringify([{ id: "owner", role: "operator", secret: credential }]) },
+      AGENT_DEMO_MODE: "1", AGENT_SESSION_SECRET: "synthetic-r3-session-signing-secret-32-bytes", AGENT_AUTH_USERS: JSON.stringify([{ id: "owner", role: "operator", secret: credential }]) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.on("data", (data) => logs.push(String(data)));

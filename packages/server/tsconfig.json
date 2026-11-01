@@ -6,11 +6,12 @@
     "tsBuildInfoFile": "dist/.tsbuildinfo",
     "baseUrl": "../..",
     "paths": {
+      "@simple-coding-agent/ai": ["packages/ai/src/index.ts"],
       "@simple-coding-agent/db": ["packages/db/src/index.ts"],
       "@simple-coding-agent/runtime": ["packages/runtime/src/index.ts"],
       "@simple-coding-agent/security": ["packages/security/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "../../types/**/*.d.ts"],
-  "references": [{ "path": "../db" }, { "path": "../runtime" }, { "path": "../security" }]
+  "references": [{ "path": "../ai" }, { "path": "../db" }, { "path": "../runtime" }, { "path": "../security" }]
 }

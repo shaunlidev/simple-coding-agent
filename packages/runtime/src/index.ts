@@ -8,6 +8,10 @@ import { readBrowserSource } from "./browser-source.js";
 export { readBrowserSource } from "./browser-source.js";
 import { contentEntities, contentIdentityKey, runContentResults, contentDeliveries, runReceipts, runRequests, createSqliteDatabase, evalReports, feedback, memoryEntries, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
 import { parseRuntimeEvent, type RuntimeEvent, type RuntimeEventType } from "./events.js";
+import { contentTaskSchema, contentCitationSchema, sourceReadSchema, type ContentTaskRecord, type ContentCitation, type SourceRead } from "./content-contract.js";
+export { contentTaskSchema } from "./content-contract.js";
+export type { ContentTask, ContentTaskRecord } from "./content-contract.js";
+export { executeContentRun, type ContentProviderFactory } from "./content-agent.js";
 export type { RuntimeEvent, RuntimeEventType } from "./events.js";
 
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -68,6 +72,7 @@ export type RuntimeSchedule = {
   nextRunAt: string;
   lastRunAt?: string;
   overlapPolicy: "skip" | "queue" | "cancel_previous";
+  taskId?: string;
 };
 
 export type MemoryState = {
@@ -169,6 +174,7 @@ export type DeliveredContentItem = {
   score: number;
   status: "delivered" | "already_delivered" | "filtered" | "failed";
   evidence: string[];
+  citations?: ContentCitation[];
   createdAt: string;
 };
 
@@ -247,7 +253,7 @@ function conflict(message: string) {
 const contentResultSchema = z.object({
   id: z.string().min(1), runId: z.string().min(1), title: z.string(), source: z.string(), url: z.string().optional(),
   summary: z.string(), reason: z.string(), score: z.number(), status: z.enum(["delivered", "already_delivered", "filtered", "failed"]),
-  evidence: z.array(z.string()), createdAt: z.iso.datetime({ offset: true }),
+  evidence: z.array(z.string()), citations: z.array(contentCitationSchema).optional(), createdAt: z.iso.datetime({ offset: true }),
 });
 const outcomeSchema = z.enum(["delivered", "no_new_items", "legacy_incomplete"]);
 
@@ -461,7 +467,7 @@ export class SQLiteRuntimeStore {
     return this.database.sqlite.transaction(() => {
       const events = this.readEvents(runId);
       if (events.length === 0) return undefined;
-      return { run: projectRun(runId, events), result: this.readRunResult(runId) ?? null, events };
+      return { run: projectRun(runId, events), result: this.readRunResult(runId) ?? null, events, task: this.readRunTask(runId) ?? null, sources: this.readSourceResults(runId) };
     })();
   }
 
@@ -480,6 +486,7 @@ export class SQLiteRuntimeStore {
       nextRunAt: row.nextRunAt ?? new Date().toISOString(),
       ...(row.lastRunAt ? { lastRunAt: row.lastRunAt } : {}),
       overlapPolicy: row.overlapPolicy as RuntimeSchedule["overlapPolicy"],
+      ...(row.taskId ? { taskId: row.taskId } : {}),
     }));
   }
 
@@ -515,12 +522,13 @@ export class SQLiteRuntimeStore {
       nextRunAt: next.nextRunAt,
       lastRunAt: next.lastRunAt,
       overlapPolicy: next.overlapPolicy,
+      taskId: next.taskId,
     });
     await this.appendEvent(this.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", { scheduleId: next.id, action: "created", enabled: next.enabled, cron: next.cron, nextRunAt: next.nextRunAt }, { source: "scheduler" }));
     return next;
   }
 
-  async updateSchedule(id: string, patch: Partial<Pick<RuntimeSchedule, "enabled" | "cron" | "timezone" | "overlapPolicy" | "nextRunAt" | "lastRunAt">>): Promise<RuntimeSchedule> {
+  async updateSchedule(id: string, patch: Partial<Pick<RuntimeSchedule, "enabled" | "cron" | "timezone" | "overlapPolicy" | "nextRunAt" | "lastRunAt" | "taskId">>): Promise<RuntimeSchedule> {
     this.redactor.identifier(id);
     for (const value of Object.values(patch)) if (typeof value === "string") this.redactor.identifier(value);
     const current = (await this.readSchedules()).find((schedule) => schedule.id === id);
@@ -534,6 +542,7 @@ export class SQLiteRuntimeStore {
       nextRunAt: next.nextRunAt,
       lastRunAt: next.lastRunAt,
       overlapPolicy: next.overlapPolicy,
+      taskId: next.taskId,
     }).where(eq(schedules.id, id));
     await this.appendEvent(this.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", { scheduleId: id, action: "updated", enabled: next.enabled, cron: next.cron, nextRunAt: next.nextRunAt }, { source: "scheduler" }));
     return next;
@@ -799,6 +808,66 @@ export class SQLiteRuntimeStore {
     }));
   }
 
+  listContentTasks(): ContentTaskRecord[] {
+    return this.database.sqlite.prepare("select * from content_tasks order by id").all().map((value) => {
+      const row = z.object({ revision: z.number().int().positive(), definition_json: z.string(), updated_at: z.string() }).parse(value);
+      return { revision: row.revision, definition: contentTaskSchema.parse(JSON.parse(row.definition_json)), updatedAt: row.updated_at };
+    });
+  }
+
+  saveContentTask(input: unknown, expectedRevision: number): ContentTaskRecord {
+    const definition = contentTaskSchema.parse(this.redactor.value(contentTaskSchema.parse(input)));
+    z.number().int().nonnegative().parse(expectedRevision);
+    return this.database.sqlite.transaction(() => {
+      const existing = this.listContentTasks().find((task) => task.definition.id === definition.id);
+      if ((existing?.revision ?? 0) !== expectedRevision) throw conflict("Task revision changed; reload before saving");
+      const revision = expectedRevision + 1;
+      const updatedAt = new Date().toISOString();
+      this.database.sqlite.prepare("insert into content_tasks values (?, ?, ?, ?) on conflict(id) do update set revision = excluded.revision, definition_json = excluded.definition_json, updated_at = excluded.updated_at")
+        .run(definition.id, revision, JSON.stringify(definition), updatedAt);
+      return { definition, revision, updatedAt };
+    }).immediate();
+  }
+
+  admitContentRun(input: { actor: string; key: string; taskId: string; trigger: "manual" | "schedule" }) {
+    return this.database.sqlite.transaction(() => {
+      const task = this.listContentTasks().find((candidate) => candidate.definition.id === input.taskId);
+      if (!task) throw Object.assign(new Error("Configured content task not found"), { statusCode: 404 });
+      const admission = this.admitRun({ actor: input.actor, key: input.key, intent: { taskId: input.taskId, title: task.definition.title, trigger: input.trigger } });
+      if (admission.created) this.database.sqlite.prepare("insert into run_task_snapshots values (?, ?, ?)").run(admission.runId, task.revision, JSON.stringify(task.definition));
+      return admission;
+    }).immediate();
+  }
+
+  readRunTask(runId: string) {
+    const value = this.database.sqlite.prepare("select * from run_task_snapshots where run_id = ?").get(runId);
+    if (!value) return undefined;
+    const row = z.object({ revision: z.number().int().positive(), definition_json: z.string() }).parse(value);
+    return { revision: row.revision, definition: contentTaskSchema.parse(JSON.parse(row.definition_json)) };
+  }
+
+  readSourceResults(runId: string): SourceRead[] {
+    return this.database.sqlite.prepare("select result_json from run_source_reads where run_id = ? order by source_id").all(runId).map((value) => sourceReadSchema.parse(JSON.parse(z.object({ result_json: z.string() }).parse(value).result_json)));
+  }
+
+  saveSourceResult(runId: string, input: SourceRead): SourceRead {
+    const result = sourceReadSchema.parse(this.redactor.value(input));
+    return this.database.sqlite.transaction(() => {
+      const task = this.readRunTask(runId);
+      if (!task?.definition.sources.some((source) => source.id === result.sourceId)) throw conflict("Source is not configured for this run");
+      if (projectRun(runId, this.readEvents(runId)).status !== "running") throw conflict("Run is not accepting source observations");
+      if (result.status === "ok" && result.documents.some((document) => document.runId !== runId || document.sourceId !== result.sourceId || document.hash !== createHash("sha256").update(document.text).digest("hex"))) throw conflict("Invalid source observation binding or hash");
+      const prior = this.readSourceResults(runId).find((source) => source.sourceId === result.sourceId);
+      if (prior) {
+        if (fingerprint(prior) !== fingerprint(result)) throw conflict("Source observation is immutable");
+        return prior;
+      }
+      this.database.sqlite.prepare("insert into run_source_reads values (?, ?, ?)").run(runId, result.sourceId, JSON.stringify(result));
+      this.writeEvent(this.createEvent(runId, "source.read.completed", z.record(z.string(), z.json()).parse(result), { severity: result.status === "failed" ? "warning" : "info" }));
+      return result;
+    }).immediate();
+  }
+
   admitRun(input: { actor: string; key: string; intent: { taskId: string; title: string; trigger: RuntimeRun["trigger"] } }) {
     const actor = this.redactor.identifier(z.string().min(1).max(128).parse(input.actor));
     const key = this.redactor.identifier(z.string().min(1).max(128).parse(input.key));
@@ -837,6 +906,26 @@ export class SQLiteRuntimeStore {
       const started = events.find((event) => event.type === "run.started");
       if (!started || events.some((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type))) throw conflict("Run is not accepting content results");
       const payload = z.record(z.string(), z.json()).parse(JSON.parse(started.payloadJson));
+      const task = this.readRunTask(runId);
+      if (task) {
+        const sources = this.readSourceResults(runId);
+        if (sources.length !== task.definition.sources.length || sources.every((source) => source.status === "failed")) throw conflict("Source coverage does not permit completion");
+        const documents = sources.flatMap((source) => source.status === "ok" ? source.documents : []);
+        const exposed = new Set(events.filter((event) => event.type === "agent.tool.completed").flatMap((event) => {
+          const result = sourceReadSchema.safeParse(JSON.parse(event.payloadJson).result);
+          return result.success && result.data.status === "ok" ? result.data.documents.map((document) => document.id) : [];
+        }));
+        for (const item of items) {
+          if (!item.citations?.length) throw conflict("Real content requires verified citations");
+          let primary = false;
+          for (const citation of item.citations) {
+            const document = documents.find((candidate) => candidate.id === citation.documentId);
+            if (!document || !exposed.has(document.id) || document.hash !== citation.hash || document.hash !== createHash("sha256").update(document.text).digest("hex") || document.readUrl !== citation.readUrl || !document.text.includes(citation.quote)) throw conflict("Content citation does not match this run's returned tool evidence");
+            if (document.url === item.url && document.sourceId === item.source && document.title === item.title) primary = true;
+          }
+          if (!primary) throw conflict("Content primary source does not match cited evidence");
+        }
+      }
       const scope = payload.trigger === "demo" || payload.mode === "demo" ? "demo" : "workspace";
       const createdAt = new Date().toISOString();
       const deliveryIds: string[] = [];
@@ -851,7 +940,7 @@ export class SQLiteRuntimeStore {
         const previousDelivery = this.database.db.select().from(contentDeliveries).where(and(eq(contentDeliveries.scope, scope), eq(contentDeliveries.channel, "inbox"), eq(contentDeliveries.contentId, id))).get();
         const status: DeliveredContentItem["status"] = item.status === "filtered" || item.status === "failed" ? item.status : previousDelivery ? "already_delivered" : delivered.length >= maxItems ? "filtered" : "delivered";
         const result = { ...item, id, status };
-        this.database.db.insert(runContentResults).values({ ...result, evidenceJson: JSON.stringify(item.evidence), position }).run();
+        this.database.db.insert(runContentResults).values({ ...result, evidenceJson: JSON.stringify(item.evidence), citationsJson: JSON.stringify(item.citations ?? []), position }).run();
         if (status === "delivered") {
           const deliveryId = randomUUID();
           this.database.db.insert(contentDeliveries).values({ id: deliveryId, runId, contentId: id, scope, channel: "inbox", provenance: scope === "demo" ? "demo" : "runtime", createdAt }).run();
@@ -866,7 +955,8 @@ export class SQLiteRuntimeStore {
         count: delivered.length, digest, deliveryIds, ...(delivered.length === 0 ? { reason: "no_new_items" } : {}),
         detail: delivered.length > 0 ? "New items committed to inbox" : "No new items; previously delivered content retained in this run",
       }));
-      this.writeEvent(this.createEvent(runId, "run.completed", { outcome, durationMs: Math.max(0, Date.now() - Date.parse(started.timestamp)) }));
+      const failedSources = this.readSourceResults(runId).filter((source) => source.status === "failed").map((source) => source.sourceId);
+      this.writeEvent(this.createEvent(runId, "run.completed", { outcome, quality: failedSources.length ? "degraded" : "complete", failedSources, durationMs: Math.max(0, Date.now() - Date.parse(started.timestamp)) }));
       const receipt = this.readRunResult(runId);
       if (!receipt) throw new Error("Committed run receipt is missing");
       return receipt;
@@ -892,6 +982,7 @@ export class SQLiteRuntimeStore {
       score: row.score,
       status: row.status,
       evidence: JSON.parse(row.evidenceJson),
+      ...(row.citationsJson === "[]" ? {} : { citations: JSON.parse(row.citationsJson) }),
       createdAt: row.createdAt,
     }));
   }
@@ -1321,7 +1412,9 @@ export class RuntimeScheduler {
     const schedule = scheduleId ? (await this.options.runtime.readSchedules()).find((candidate) => candidate.id === scheduleId) : undefined;
     if (scheduleId && !schedule) throw new Error(`Schedule not found: ${scheduleId}`);
     const intent = { taskId: schedule?.id ?? "manual-content", title: schedule?.title ?? "Content run", trigger: "manual" as const };
-    const admission = this.options.runtime.admitRun({ ...request, intent });
+    const admission = schedule?.taskId
+      ? this.options.runtime.admitContentRun({ ...request, taskId: schedule.taskId, trigger: "manual" })
+      : this.options.runtime.admitRun({ ...request, intent });
     if (!admission.created) return admission.runId;
     try {
       if (!schedule) return await runDemoAgent(this.options.runtime, { runId: admission.runId, trigger: "manual", delayMs: 0 });
@@ -1382,7 +1475,7 @@ export class RuntimeScheduler {
           reason: "overlap_queue",
           detail: `Schedule ${schedule.id} queued behind the active run`,
         }, { source: "scheduler" }));
-        active.finally(() => {
+        void active.catch(() => undefined).then(() => {
           this.runQueuedSchedule(schedule.id).catch((error) => {
             process.stderr.write(`queued schedule failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
@@ -1400,13 +1493,16 @@ export class RuntimeScheduler {
   }
 
   private async startScheduleRun(schedule: RuntimeSchedule, reason: "due" | "manual" | "queued" | "cancel_previous", now: Date, admittedRunId?: string): Promise<SchedulerRunResult> {
-    const runId = admittedRunId ?? `run-${randomUUID()}`;
+    const admission = !admittedRunId && schedule.taskId ? this.options.runtime.admitContentRun({ actor: "scheduler", key: `${schedule.id}:${now.toISOString()}`, taskId: schedule.taskId, trigger: "schedule" }) : undefined;
+    const runId = admittedRunId ?? admission?.runId ?? `run-${randomUUID()}`;
+    if (admission && !admission.created) return { status: "started", scheduleId: schedule.id, runId, reason };
     await this.options.runtime.markScheduleTriggered(schedule.id, runId, now, reason);
-    const run = this.runAgent({ runId, schedule, trigger: "schedule", emitSchedulerEvent: false });
+    const run = this.runAgent({ runId, schedule, trigger: reason === "manual" ? "manual" : "schedule", emitSchedulerEvent: false });
     this.activeRuns.set(schedule.id, run);
-    run.finally(() => {
+    const cleanup = () => {
       if (this.activeRuns.get(schedule.id) === run) this.activeRuns.delete(schedule.id);
-    });
+    };
+    void run.then(cleanup, cleanup);
     if (!this.options.runAgent) await run;
     return { status: "started", scheduleId: schedule.id, runId, reason };
   }

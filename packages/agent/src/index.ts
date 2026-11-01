@@ -25,6 +25,7 @@ export type AgentLoopOptions = {
   tools?: readonly ToolDefinition[];
   systemPrompt?: string;
   maxTurns?: number;
+  maxToolCalls?: number;
   signal?: AbortSignal;
 };
 
@@ -105,6 +106,11 @@ async function produceAgentLoop(
   }
 
   const maxTurns = options.maxTurns ?? 8;
+  const maxToolCalls = options.maxToolCalls ?? 32;
+  if (!Number.isSafeInteger(maxTurns) || maxTurns < 1 || !Number.isSafeInteger(maxToolCalls) || maxToolCalls < 0) {
+    throw new Error("Agent turn/tool limits must be nonnegative integers with at least one turn");
+  }
+  let toolCallsUsed = 0;
   const tools = new Map((options.tools ?? []).map((tool) => [tool.name, tool]));
   const messages: Message[] = [...cloneMessages(initialMessages), { role: "user", content: prompt }];
 
@@ -149,7 +155,7 @@ async function produceAgentLoop(
     const assistant = await providerStream.result();
     messages.push(cloneMessage(assistant));
 
-    if (assistant.stopReason === "error") {
+    if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
       stream.push({ type: "agent_end", messages: cloneMessages(messages) });
       return;
     }
@@ -169,6 +175,8 @@ async function produceAgentLoop(
         stream.push({ type: "agent_end", messages: cloneMessages(messages) });
         return;
       }
+      if (toolCallsUsed >= maxToolCalls) throw new Error(`Agent loop exceeded maxToolCalls ${maxToolCalls}`);
+      toolCallsUsed++;
       const tool = tools.get(toolCall.name);
       if (!tool) {
         throw new Error(`Unknown tool "${toolCall.name}"`);
@@ -210,6 +218,8 @@ function createAgentErrorMessage(error: unknown, stopReason: "error" | "aborted"
     content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
     stopReason,
     errorMessage: error instanceof Error ? error.message : String(error),
+    ...(error instanceof Error && "code" in error && typeof error.code === "string" ? { errorCode: error.code } : {}),
+    ...(error instanceof Error && "retryable" in error && typeof error.retryable === "boolean" ? { retryable: error.retryable } : {}),
   };
 }
 
@@ -255,21 +265,31 @@ export class Agent {
     }
 
     this.#isStreaming = true;
+    const lifecycle = new AbortController();
+    const upstream = options.signal ?? this.#options.signal;
     const loopStream = runAgentLoop(
       prompt,
-      { ...this.#options, signal: options.signal ?? this.#options.signal },
+      { ...this.#options, signal: upstream ? AbortSignal.any([upstream, lifecycle.signal]) : lifecycle.signal },
       this.#messages,
     );
+    // A listener can fail before the producer ends. Observe its result immediately and abort/drain on failure.
+    const completion = loopStream.result();
+    void completion.catch(() => undefined);
 
     try {
       for await (const event of loopStream) {
         await this.#notify(event);
       }
 
-      const result = await loopStream.result();
+      const result = await completion;
       this.#messages = cloneMessages(result.messages);
       return cloneMessage(result.assistant);
+    } catch (error) {
+      lifecycle.abort(error);
+      await completion.catch(() => undefined);
+      throw error;
     } finally {
+      lifecycle.abort();
       this.#isStreaming = false;
     }
   }

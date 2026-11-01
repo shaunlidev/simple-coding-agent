@@ -2,7 +2,7 @@ import { z } from "zod";
 import { permittedUrl } from "./network.js";
 import { redactSecrets } from "./redaction.js";
 export { createRedactor, redactSecrets } from "./redaction.js";
-export { SafeNetwork, isPublicAddress, permittedUrl, pinnedLookup, type NetworkDocument } from "./network.js";
+export { SafeNetwork, createCloudflareResolver, isPublicAddress, permittedUrl, pinnedLookup, type NetworkDocument } from "./network.js";
 
 export const envSchema = z.object({
   DEEPSEEK_API_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().min(1).optional()),
@@ -18,6 +18,8 @@ export const envSchema = z.object({
   AGENT_SESSION_SECRET: z.preprocess((value) => value === "" ? undefined : value, z.string().min(32).optional()),
   AGENT_AUTH_USERS: z.string().default("[]"),
   AGENT_TRUST_PROXY: z.enum(["0", "1"]).default("0"),
+  AGENT_DEMO_MODE: z.enum(["0", "1"]).default("0"),
+  AGENT_DNS_MODE: z.enum(["system", "cloudflare"]).default("system"),
   NODE_ENV: z.string().optional(),
 }).superRefine((env, context) => {
   const requiresSecrets = env.AGENT_REQUIRE_PRODUCTION_SECRETS === "1" || env.AGENT_REQUIRE_PRODUCTION_SECRETS === "true" || env.NODE_ENV === "production";

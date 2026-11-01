@@ -16,7 +16,7 @@ const users = [
   { id: "guest", role: "viewer", secret: "synthetic-viewer-credential-with-32-bytes" },
 ];
 const server = await createAgentOpsServer({ env: {
-  AGENT_DB_PATH: ":memory:", AGENT_AUTH_USERS: JSON.stringify(users),
+  AGENT_DB_PATH: ":memory:", AGENT_DEMO_MODE: "1", AGENT_AUTH_USERS: JSON.stringify(users),
   DEEPSEEK_API_KEY: secretProbe,
   AGENT_SESSION_SECRET: "synthetic-session-signing-secret-with-32-bytes",
   AGENT_PUBLIC_ORIGIN: origin, AGENT_CORS_ORIGIN: origin,

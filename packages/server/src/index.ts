@@ -5,8 +5,9 @@ import { existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RuntimeScheduler, SQLiteRuntimeStore, type RuntimeSchedule } from "@simple-coding-agent/runtime";
-import { SafeNetwork, createRedactor, evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
+import { RuntimeScheduler, SQLiteRuntimeStore, contentTaskSchema, executeContentRun, type ContentProviderFactory, type RuntimeSchedule } from "@simple-coding-agent/runtime";
+import { createDeepSeekProvider } from "@simple-coding-agent/ai";
+import { SafeNetwork, createCloudflareResolver, createRedactor, evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
 import { z } from "zod";
 import { parseAuthUsers, registerAuthentication } from "./auth.js";
 import { GuardedToolExecutor } from "./tool-executor.js";
@@ -17,9 +18,12 @@ export type AgentOpsServerOptions = {
   logStream?: { write: (message: string) => void };
   startScheduler?: boolean;
   dashboardRoot?: string;
+  providerFactory?: ContentProviderFactory;
+  network?: SafeNetwork;
 };
 
 const createScheduleSchema = z.object({
+  taskId: z.string().min(1).optional(),
   id: z.string().min(1),
   title: z.string().min(1),
   cron: z.string().min(1),
@@ -30,6 +34,7 @@ const createScheduleSchema = z.object({
 });
 
 const patchScheduleSchema = z.object({
+  taskId: z.string().min(1).optional(),
   enabled: z.boolean().optional(),
   cron: z.string().min(1).optional(),
   timezone: z.string().min(1).optional(),
@@ -93,8 +98,22 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   const users = parseAuthUsers(env);
   const urlAllowlist = parseUrlAllowlist(env.AGENT_URL_ALLOWLIST);
   if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
-  const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH, network: new SafeNetwork({ allowlist: urlAllowlist }), secrets: [env.DEEPSEEK_API_KEY ?? "", env.AGENT_SESSION_SECRET ?? "", ...users.map((user) => user.secret)] });
-  const scheduler = new RuntimeScheduler({ runtime });
+  const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH, network: options.network ?? new SafeNetwork({ allowlist: urlAllowlist, ...(env.AGENT_DNS_MODE === "cloudflare" ? { resolve: createCloudflareResolver() } : {}) }), secrets: [env.DEEPSEEK_API_KEY ?? "", env.AGENT_SESSION_SECRET ?? "", ...users.map((user) => user.secret)] });
+  const active = new Map<string, { controller: AbortController; completion: Promise<string> }>();
+  const providerFactory: ContentProviderFactory = options.providerFactory ?? ((task) => {
+    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY is required for real content runs");
+    return createDeepSeekProvider({ apiKey: env.DEEPSEEK_API_KEY, model: task.model, stream: true, maxOutputTokens: task.limits.maxOutputTokens, responseFormat: "json_object", toolChoice: "required" });
+  });
+  function startExecution(runId: string): Promise<string> {
+    const existing = active.get(runId);
+    if (existing) return existing.completion;
+    const controller = new AbortController();
+    const completion = executeContentRun(runtime, runId, { providerFactory, signal: controller.signal });
+    active.set(runId, { controller, completion });
+    void completion.then(() => active.delete(runId), () => active.delete(runId));
+    return completion;
+  }
+  const scheduler = new RuntimeScheduler({ runtime, ...(env.AGENT_DEMO_MODE === "1" ? {} : { runAgent: ({ runId }: { runId: string }) => startExecution(runId) }) });
   const app = Fastify({
     logger: options.logger ? {
       ...(options.logStream ? { stream: options.logStream } : {}),
@@ -165,10 +184,14 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   });
 
   if (options.startScheduler) scheduler.start();
-  app.addHook("onClose", async () => scheduler.stop());
+  app.addHook("onClose", async () => {
+    scheduler.stop();
+    const jobs = [...active.values()];
+    for (const job of jobs) job.controller.abort(new Error("Server shutting down"));
+    await Promise.allSettled(jobs.map((job) => job.completion));
+  });
 
   function runRequest(request: FastifyRequest) {
-    z.object({}).strict().parse(request.body ?? {});
     const actor = auth.currentUser(request);
     if (!actor) throw Object.assign(new Error("Sign in required"), { statusCode: 401 });
     const key = z.string().min(1).max(128).parse(request.headers["idempotency-key"] ?? randomUUID());
@@ -176,11 +199,32 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   }
 
   app.post("/api/runs/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request) => {
-    const runId = await scheduler.runNow(undefined, runRequest(request));
-    return { accepted: true, runId };
+    const body = z.object({ taskId: z.string().min(1).optional() }).strict().parse(request.body ?? {});
+    const identity = runRequest(request);
+    if (!body.taskId && env.AGENT_DEMO_MODE === "1") return { accepted: true, runId: await scheduler.runNow(undefined, identity) };
+    const taskId = z.string().min(1, "Select a configured content task").parse(body.taskId ?? "");
+    const admission = runtime.admitContentRun({ ...identity, taskId, trigger: "manual" });
+    if (admission.created) void startExecution(admission.runId).catch(() => undefined);
+    return { accepted: true, runId: admission.runId };
+  });
+
+  app.get("/api/tasks", async () => ({ tasks: runtime.listContentTasks(), demoMode: env.AGENT_DEMO_MODE === "1", defaultModel: env.DEEPSEEK_MODEL }));
+  app.put("/api/tasks/:id", async (request: FastifyRequest<{ Params: { id: string } }>) => {
+    const input = z.object({ definition: contentTaskSchema, expectedRevision: z.number().int().nonnegative() }).strict().parse(request.body);
+    if (input.definition.id !== request.params.id) throw Object.assign(new Error("Task ID mismatch"), { statusCode: 400 });
+    for (const source of input.definition.sources) {
+      try { await runtime.network.validate(source.url); }
+      catch { throw Object.assign(new Error(`Source ${source.id} is outside the configured network policy or unavailable`), { statusCode: 400 }); }
+    }
+    return runtime.saveContentTask(input.definition, input.expectedRevision);
   });
 
   app.post("/api/schedules/:id/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request: FastifyRequest<{ Params: { id: string } }>) => {
+    z.object({}).strict().parse(request.body ?? {});
+    if (env.AGENT_DEMO_MODE !== "1") {
+      const schedule = (await runtime.readSchedules()).find((schedule) => schedule.id === request.params.id);
+      if (!schedule?.taskId) throw Object.assign(new Error("Schedule has no configured content task"), { statusCode: 400 });
+    }
     const runId = await scheduler.runNow(request.params.id, runRequest(request));
     return { accepted: true, runId };
   });
@@ -340,7 +384,10 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       timezone: parsed.data.timezone,
       nextRunAt: parsed.data.nextRunAt ?? new Date().toISOString(),
       overlapPolicy: parsed.data.overlapPolicy,
+      ...(parsed.data.taskId ? { taskId: parsed.data.taskId } : {}),
     };
+    if (env.AGENT_DEMO_MODE !== "1" && !schedule.taskId) throw Object.assign(new Error("A configured task is required for scheduling"), { statusCode: 400 });
+    if (schedule.taskId && !runtime.listContentTasks().some((task) => task.definition.id === schedule.taskId)) throw Object.assign(new Error("Content task not found"), { statusCode: 400 });
     return await runtime.createSchedule(schedule);
   });
 
@@ -349,6 +396,12 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
     if (!parsed.success) {
       reply.status(400);
       return { error: { code: "INVALID_SCHEDULE_PATCH", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    if (env.AGENT_DEMO_MODE !== "1") {
+      const current = (await runtime.readSchedules()).find((schedule) => schedule.id === request.params.id);
+      const taskId = parsed.data.taskId ?? current?.taskId;
+      if ((parsed.data.enabled ?? current?.enabled) && !taskId) throw Object.assign(new Error("Bind a configured task before enabling this schedule"), { statusCode: 400 });
+      if (taskId && !runtime.listContentTasks().some((task) => task.definition.id === taskId)) throw Object.assign(new Error("Content task not found"), { statusCode: 400 });
     }
     return await runtime.updateSchedule(request.params.id, parsed.data);
   });

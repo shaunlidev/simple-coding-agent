@@ -198,9 +198,14 @@ export async function fetchSnapshot(): Promise<RuntimeSnapshot> {
   return requestJson<RuntimeSnapshot>("/api/snapshot");
 }
 
-export async function runNow(key: string): Promise<{ accepted: true; runId: string }> {
-  return requestJson<{ accepted: true; runId: string }>("/api/runs/run-now", { method: "POST", headers: { "idempotency-key": key }, body: "{}" });
+export async function runNow(key: string, taskId?: string): Promise<{ accepted: true; runId: string }> {
+  return requestJson<{ accepted: true; runId: string }>("/api/runs/run-now", { method: "POST", headers: { "idempotency-key": key }, body: JSON.stringify(taskId ? { taskId } : {}) });
 }
+
+export type ContentTask = { id: string; title: string; instruction: string; model: string; sources: { id: string; kind: "rss" | "url" | "browser"; url: string }[] };
+export type ContentTaskRecord = { definition: ContentTask; revision: number; updatedAt: string };
+export const fetchTasks = () => requestJson<{ tasks: ContentTaskRecord[]; demoMode: boolean; defaultModel: string }>("/api/tasks");
+export const saveTask = (definition: ContentTask) => requestJson<ContentTaskRecord>(`/api/tasks/${encodeURIComponent(definition.id)}`, { method: "PUT", body: JSON.stringify({ definition, expectedRevision: 0 }) });
 
 export type RunDetail = {
   run: RuntimeRun;
