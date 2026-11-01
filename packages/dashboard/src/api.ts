@@ -145,19 +145,52 @@ export type RuntimeSnapshot = {
   events: RuntimeEvent[];
 };
 
+let csrfToken: string | undefined;
+
+class ApiError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
 async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, {
     ...init,
+    credentials: "same-origin",
     headers: {
       "content-type": "application/json",
+      ...(csrfToken ? { "x-csrf-token": csrfToken } : {}),
       ...(init?.headers ?? {}),
     },
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
+    if (response.status === 401 && !input.startsWith("/api/auth/")) window.dispatchEvent(new Event("agent-auth-expired"));
+    throw new ApiError(response.status, text || `Request failed: ${response.status}`);
   }
   return response.json() as Promise<T>;
+}
+
+export type AuthSession = { user: { id: string; role: "viewer" | "operator" }; csrfToken: string };
+
+export async function fetchSession(): Promise<AuthSession | null> {
+  try {
+    const session = await requestJson<AuthSession>("/api/auth/session");
+    csrfToken = session.csrfToken;
+    return session;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) { csrfToken = undefined; return null; }
+    throw error;
+  }
+}
+
+export async function login(credentials: { id: string; secret: string }): Promise<AuthSession> {
+  const session = await requestJson<AuthSession>("/api/auth/login", { method: "POST", body: JSON.stringify(credentials) });
+  csrfToken = session.csrfToken;
+  return session;
+}
+
+export async function logout(): Promise<void> {
+  await requestJson("/api/auth/logout", { method: "POST", body: "{}" });
+  csrfToken = undefined;
 }
 
 export async function fetchSnapshot(): Promise<RuntimeSnapshot> {

@@ -126,6 +126,9 @@ export type SqliteDatabase = {
 };
 
 const migrations = [
+  `create table if not exists execution_approvals (id text primary key, run_id text not null, tool text not null, args_hash text not null, requested_by text not null, approved_by text, status text not null check (status in ('pending','approved','consumed','denied')), expires_at integer not null, consumed_at integer, created_at integer not null)`,
+  `create table if not exists auth_sessions (id_hash text primary key, generation text not null, payload_json text not null, expires_at integer not null)`,
+  `create index if not exists auth_sessions_expiry_idx on auth_sessions (expires_at)`,
   `create table if not exists runs (id text primary key, task_id text not null, title text not null, status text not null, trigger text not null, started_at text, completed_at text, duration_ms integer, cost_usd real not null default 0, input_tokens integer not null default 0, output_tokens integer not null default 0)`,
   `create table if not exists runtime_events (id text primary key, run_id text not null, type text not null, source text not null, severity text not null, timestamp text not null, payload_json text not null)`,
   `create table if not exists spans (id text primary key, run_id text not null, parent_id text, type text not null, name text not null, status text not null, started_at text not null, duration_ms integer not null default 0, cost_usd real not null default 0, input_tokens integer not null default 0, output_tokens integer not null default 0, summary text not null)`,

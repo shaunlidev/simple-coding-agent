@@ -4,13 +4,16 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RuntimeScheduler, SQLiteRuntimeStore, type MemoryEntryInput, type RuntimeSchedule } from "@simple-coding-agent/runtime";
-import { evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
+import { RuntimeScheduler, SQLiteRuntimeStore, type RuntimeSchedule } from "@simple-coding-agent/runtime";
+import { SafeNetwork, createRedactor, evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
 import { z } from "zod";
+import { parseAuthUsers, registerAuthentication } from "./auth.js";
+import { GuardedToolExecutor } from "./tool-executor.js";
 
 export type AgentOpsServerOptions = {
   env?: Record<string, string | undefined>;
   logger?: boolean;
+  logStream?: { write: (message: string) => void };
   startScheduler?: boolean;
   dashboardRoot?: string;
 };
@@ -45,63 +48,85 @@ const feedbackSchema = z.object({
 
 const memoryEntrySchema = z.object({
   kind: z.enum(["preference", "blocked_topic", "source_weight", "lesson", "knowledge"]),
-  sourceTrust: z.enum(["user", "system", "trusted_tool", "external"]),
   content: z.string().min(1),
   metadata: z.record(z.string(), z.unknown()).optional(),
-});
+}).strict();
 
 const toolCheckSchema = z.object({
   toolName: z.string().min(1),
   url: z.string().url().optional(),
-  approved: z.boolean().default(false),
-});
+}).strict();
+
+const operationSchema = z.object({ runId: z.string().min(1), tool: z.string().min(1), args: z.json() }).strict();
+const executeSchema = operationSchema.extend({ approvalId: z.string().uuid().optional() }).strict();
 
 const secretScanSchema = z.object({
   text: z.string(),
 });
 
-function errorEnvelope(error: unknown) {
+function errorEnvelope(error: unknown, redactor = createRedactor()) {
   const message = error instanceof Error ? error.message : String(error);
   return {
     error: {
       code: "AGENT_OPS_ERROR",
-      message: redactSecrets(message),
+      message: redactor.text(message),
     },
   };
 }
 
-function redactForResponse<T>(value: T): T {
-  return JSON.parse(redactSecrets(JSON.stringify(value))) as T;
+function redactForResponse(value: unknown): unknown {
+  return createRedactor().value(value);
 }
 
 async function sendSseSnapshot(reply: FastifyReply, runtime: SQLiteRuntimeStore, closeAfterFirst: boolean) {
-  const snapshot = redactForResponse(await runtime.snapshot());
-  reply.raw.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+  const snapshot = await runtime.snapshot();
+  reply.raw.write(`event: snapshot\ndata: ${runtime.redactor.json(snapshot)}\n\n`);
   for (const event of snapshot.events.slice().reverse()) {
-    reply.raw.write(`event: runtime-event\ndata: ${JSON.stringify(event)}\n\n`);
+    reply.raw.write(`event: runtime-event\ndata: ${runtime.redactor.json(event)}\n\n`);
   }
   if (closeAfterFirst) reply.raw.end();
 }
 
 export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) {
   const env = parseEnvironment(options.env ?? process.env);
-  if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
-  const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH === ":memory:" ? ":memory:" : env.AGENT_DB_PATH });
-  const scheduler = new RuntimeScheduler({ runtime });
+  const users = parseAuthUsers(env);
   const urlAllowlist = parseUrlAllowlist(env.AGENT_URL_ALLOWLIST);
-  const app = Fastify({ logger: options.logger ?? false });
+  if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
+  const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH, network: new SafeNetwork({ allowlist: urlAllowlist }), secrets: [env.DEEPSEEK_API_KEY ?? "", env.AGENT_SESSION_SECRET ?? "", ...users.map((user) => user.secret)] });
+  const scheduler = new RuntimeScheduler({ runtime });
+  const app = Fastify({
+    logger: options.logger ? {
+      ...(options.logStream ? { stream: options.logStream } : {}),
+      serializers: { req: (request) => ({ method: request.method, url: runtime.redactor.text(request.url), id: request.id }), res: (reply) => ({ statusCode: reply.statusCode }) },
+      redact: ["req.headers.cookie", "req.headers.authorization", "res.headers.set-cookie"],
+    } : false,
+    bodyLimit: 64 * 1024,
+    trustProxy: env.AGENT_TRUST_PROXY === "1" ? "loopback" : false,
+  });
 
   app.setErrorHandler((error, _request, reply) => {
     const candidate = error as { statusCode?: number };
-    const statusCode = candidate.statusCode && candidate.statusCode >= 400 && candidate.statusCode < 600 ? candidate.statusCode : 500;
-    reply.status(statusCode).send(errorEnvelope(error));
+    const statusCode = error instanceof z.ZodError ? 400 : candidate.statusCode && candidate.statusCode >= 400 && candidate.statusCode < 600 ? candidate.statusCode : 500;
+    reply.status(statusCode).send(errorEnvelope(error, runtime.redactor));
   });
 
-  await app.register(cors, { origin: env.AGENT_CORS_ORIGIN === "*" ? true : env.AGENT_CORS_ORIGIN });
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (request.routeOptions.url?.startsWith("/api/auth/")) return payload;
+    if (typeof payload === "string" && String(reply.getHeader("content-type")).includes("application/json")) {
+      return runtime.redactor.json(JSON.parse(payload));
+    }
+    return payload;
+  });
+
+  await app.register(cors, { origin: env.AGENT_CORS_ORIGIN, credentials: true });
+  const auth = await registerAuthentication(app, env, runtime, users);
+  const executor = new GuardedToolExecutor({ runtime, tools: new Map([
+    ["memory_clear", { requiresApproval: true, parameters: z.object({ confirmation: z.literal("clear-memory") }).strict(), execute: async () => { await runtime.clearMemory(); return { ok: true }; } }],
+  ]) });
 
   const dashboardRoot = options.dashboardRoot ?? fileURLToPath(new URL("../../dashboard/dist/", import.meta.url));
   if (existsSync(dashboardRoot)) {
-    await app.register(fastifyStatic, { root: dashboardRoot, index: "index.html", maxAge: 0 });
+    await app.register(fastifyStatic, { root: dashboardRoot, index: "index.html", maxAge: 0, wildcard: true, list: false });
   }
 
   app.get("/healthz", async () => ({ ok: true }));
@@ -141,12 +166,12 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   if (options.startScheduler) scheduler.start();
   app.addHook("onClose", async () => scheduler.stop());
 
-  app.post("/api/runs/run-now", async () => {
+  app.post("/api/runs/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async () => {
     const runId = await scheduler.runNow();
     return { accepted: true, runId };
   });
 
-  app.post("/api/schedules/:id/run-now", async (request: FastifyRequest<{ Params: { id: string } }>) => {
+  app.post("/api/schedules/:id/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request: FastifyRequest<{ Params: { id: string } }>) => {
     const runId = await scheduler.runNow(request.params.id);
     return { accepted: true, runId };
   });
@@ -172,9 +197,10 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
     await sendSseSnapshot(reply, runtime, once);
     if (once) return reply;
     const timer = setInterval(() => {
-      sendSseSnapshot(reply, runtime, false).catch((error) => {
-        reply.raw.write(`event: runtime-error\ndata: ${JSON.stringify(errorEnvelope(error))}\n\n`);
-      });
+      request.session.reload().then(async () => {
+        if (!auth.currentUser(request)) { clearInterval(timer); reply.raw.end(); return; }
+        await sendSseSnapshot(reply, runtime, false);
+      }).catch(() => { clearInterval(timer); reply.raw.end(); });
     }, 1000);
     request.raw.on("close", () => clearInterval(timer));
     return reply;
@@ -184,7 +210,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
 
   app.get("/api/security/audit", async () => redactForResponse({
     audit: await runtime.listSecurityAudit(),
-    approvals: await runtime.listToolApprovals(),
+    approvals: executor.listApprovals(),
   }));
 
   app.post("/api/security/tool-check", async (request, reply) => {
@@ -194,12 +220,6 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       return { error: { code: "INVALID_TOOL_CHECK", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
     }
     const decision = evaluateToolCall({ ...parsed.data, allowlist: urlAllowlist });
-    await runtime.recordToolApproval({
-      tool: decision.tool,
-      risk: decision.risk,
-      status: decision.allowed ? "approved" : "denied",
-      reason: redactSecrets(decision.reason),
-    });
     if (!decision.allowed) {
       await runtime.recordSecurityAudit({
         action: decision.tool,
@@ -228,9 +248,35 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
 
   app.get("/api/memory/export", async () => await runtime.exportMemory());
 
-  app.delete("/api/memory", async () => {
-    await runtime.clearMemory();
-    return { ok: true };
+  app.post("/api/security/approvals", async (request, reply) => {
+    const parsed = operationSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: { code: "INVALID_OPERATION", message: "Provide runId, registered tool and arguments only" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return executor.requestApproval({ ...parsed.data, actor: actor.id });
+  });
+
+  app.post("/api/security/approvals/:id/approve", async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
+    if (!z.object({}).strict().safeParse(request.body ?? {}).success) return reply.code(400).send({ error: { code: "INVALID_APPROVAL", message: "Approver identity is supplied by the session" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return executor.approve(request.params.id, actor.id);
+  });
+
+  app.post("/api/tools/execute", async (request, reply) => {
+    const parsed = executeSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: { code: "INVALID_OPERATION" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return executor.execute({ ...parsed.data, actor: actor.id });
+  });
+
+  app.delete("/api/memory", async (request, reply) => {
+    const parsed = z.object({ runId: z.string().min(1), approvalId: z.string().uuid() }).strict().safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: { code: "APPROVAL_REQUIRED", message: "A bound memory_clear approval is required" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return executor.execute({ ...parsed.data, actor: actor.id, tool: "memory_clear", args: { confirmation: "clear-memory" } });
   });
 
   app.get("/api/memory/search", async (request, reply) => {
@@ -260,7 +306,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       return { error: { code: "INVALID_MEMORY_ENTRY", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
     }
     try {
-      return await runtime.writeMemoryEntry(parsed.data as MemoryEntryInput);
+      return await runtime.writeMemoryEntry({ ...parsed.data, sourceTrust: "user" });
     } catch (error) {
       await runtime.appendEvent(runtime.createEvent(`memory-denied-${Date.now().toString(36)}`, "security.policy.denied", {
         action: "memory.write",

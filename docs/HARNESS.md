@@ -40,3 +40,5 @@ Capture:
 ## Agent Ops Harness Boundary
 
 The Agent Ops harness must validate production behavior, not generated showcase files. It should read runtime/API/database evidence, reject secret-like values, and produce enough JSON evidence for the dashboard and CI to diagnose failures.
+
+R2 adds real-session auth fixtures, an approval executor with side-effect counters and actual SQLite clearing, network-policy tests at the pipeline boundary, and redaction checks over raw persisted rows and captured logs. `scripts/verify-auth.mjs` operates the built UI at desktop/mobile widths and makes authenticated approval requests through that browser context. `scripts/verify-container.mjs` checks production HTTPS cookie/CSRF behavior in the built image. `evals/browser-security.live.eval.ts` runs actual Chromium against adversarial controlled content and verifies the forbidden destination received zero requests. None of these is evidence of live model quality or cloud readiness.

@@ -32,12 +32,14 @@ test("security enforces URL allowlist and high-risk tool approval", () => {
   const allowedRead = evaluateToolCall({ toolName: "browser_navigate", url: "https://www.bilibili.com/video", allowlist });
   const deniedUrl = evaluateToolCall({ toolName: "browser_navigate", url: "https://evil.test", allowlist });
   const deniedWrite = evaluateToolCall({ toolName: "browser_type", allowlist });
-  const approvedWrite = evaluateToolCall({ toolName: "browser_type", approved: true, allowlist });
+  const forged = { toolName: "browser_type", approved: true, allowlist };
+  const approvedWrite = evaluateToolCall(forged);
 
   assert.equal(isUrlAllowed("https://example.test/post/1", allowlist), true);
   assert.equal(allowedRead.allowed, true);
   assert.equal(deniedUrl.allowed, false);
   assert.match(deniedUrl.reason, /outside allowlist/);
   assert.equal(deniedWrite.allowed, false);
-  assert.equal(approvedWrite.allowed, true);
+  assert.equal(approvedWrite.allowed, false);
+  assert.equal(evaluateToolCall({ ...forged, toolName: "unknown" }).allowed, false);
 });

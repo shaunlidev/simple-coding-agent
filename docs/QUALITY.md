@@ -4,7 +4,9 @@
 
 The 2026-11-01 review of commit `797ccb8` reopened production acceptance. Local tests passed before that commit, but targeted behavior checks and an actual Docker build exposed gaps. A passing local suite is not release approval.
 
-The original scope remains in [0008 production plan](plans/active/0008-agent-ops-dashboard-production.md). Repair scope and acceptance gates are proposed in [0009 acceptance recovery](plans/active/0009-agent-ops-acceptance-recovery.md).
+The original scope remains in [0008 production plan](plans/active/0008-agent-ops-dashboard-production.md). Repair scope and acceptance gates are approved in [0009 acceptance recovery](plans/active/0009-agent-ops-acceptance-recovery.md).
+
+R1 passed clean installation and native Linux arm64 container/browser checks; it was pushed as `98501c5`. R2 now passes authenticated session/role/CSRF, bound approval, actual network-boundary and pre-persistence redaction checks, including production-cookie HTTPS container verification. Details and limitations are in `docs/evidence/R1-clean-build.md` and `docs/evidence/R2-security-boundaries.md`. Neither closes cloud acceptance.
 
 ## Existing checks
 
@@ -20,10 +22,9 @@ The existing dashboard and deployment checks inspect build output and file text.
 
 | Gap | Evidence from review | Repair |
 | --- | --- | --- |
-| Clean installation | No declared TypeScript dependency; checks rely on global tsc | R1 |
-| Container readiness | Docker build fails during better-sqlite3 installation | R1, R10 |
-| Authorization | Anonymous requests can write and export memory; approvals trust client input | R2 |
-| Execution policy | Pipeline fetch can bypass the standalone allowlist check | R2, R4 |
+| Deployment target | Linux arm64 container passed; selected cloud platform and architecture remain unverified | R10 |
+| Dependency advisories | Three moderate affected packages in unused glob/minimatch static enumeration path; no high/critical in official production audit | R2 triage; re-audit R10 |
+| Historical secrets | New writes/outputs are redacted; existing databases are not retroactively scrubbed | R3 migration / R10 release |
 | Content/run consistency | Repeated runs can have a nonempty digest with no latest-run result rows | R3 |
 | Real dashboard agent | Default execution uses mock sources and extractive summaries | R4 |
 | Schedule semantics | Host timezone affects execution; cancellation does not stop the old task | R5 |
@@ -33,6 +34,8 @@ The existing dashboard and deployment checks inspect build output and file text.
 | Release evidence | Browser, cloud, restart, backup, restore, and rollback gates remain unverified | R9, R10 |
 
 Record new regression coverage against behavior. A missing or skipped measurement remains unverified.
+
+The default suite still reports two keyless DeepSeek tests as passed because those tests return early. They are NOT live model evidence; explicit skip reporting is required in R9. Existing bundle-word and deployment-file checks remain only static evidence, alongside the new actual R1/R2 browser/container gates.
 
 ## Rule
 

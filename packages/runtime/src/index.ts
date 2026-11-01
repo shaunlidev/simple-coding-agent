@@ -1,6 +1,9 @@
 import { asc, eq } from "drizzle-orm";
 import cron from "node-cron";
 import type { ScheduledTask } from "node-cron";
+import { SafeNetwork, createRedactor } from "@simple-coding-agent/security";
+import { readBrowserSource } from "./browser-source.js";
+export { readBrowserSource } from "./browser-source.js";
 import { contentItems, createSqliteDatabase, evalReports, feedback, memoryEntries, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
 
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -191,14 +194,10 @@ export type DeliveredContentItem = {
   createdAt: string;
 };
 
-export type BrowserContentAdapter = {
-  read(url: string): Promise<{ title: string; url: string; text: string; links?: Array<{ text: string; url?: string }> }>;
-};
-
 export type ContentPipelineOptions = {
   sources?: ContentSource[];
-  fetch?: typeof fetch;
-  browser?: BrowserContentAdapter;
+  network?: SafeNetwork;
+  signal?: AbortSignal;
   maxItems?: number;
   budget?: {
     maxCostUsd?: number;
@@ -385,18 +384,25 @@ function rootSpanFromRun(run: RuntimeRun, events: RuntimeEvent[]): RuntimeSpan {
 export type SQLiteRuntimeStoreOptions = {
   database?: SqliteDatabase;
   path?: string;
+  secrets?: readonly string[];
+  network?: SafeNetwork;
 };
 
 export class SQLiteRuntimeStore {
   readonly database: SqliteDatabase;
+  readonly redactor: ReturnType<typeof createRedactor>;
+  readonly network: SafeNetwork;
 
   constructor(options: SQLiteRuntimeStoreOptions = {}) {
+    this.redactor = createRedactor(options.secrets);
+    this.network = options.network ?? new SafeNetwork({ allowlist: [] });
     this.database = options.database ?? createSqliteDatabase(options.path ?? ":memory:");
     migrateSqliteDatabase(this.database);
   }
 
   async appendEvent(event: RuntimeEvent): Promise<RuntimeEvent> {
     validateEvent(event);
+    event = { ...event, id: this.redactor.identifier(event.id), runId: this.redactor.identifier(event.runId), source: this.redactor.text(event.source), payload: this.redactor.record(event.payload) };
     await this.database.db.insert(runtimeEvents).values({
       id: event.id,
       runId: event.runId,
@@ -477,8 +483,12 @@ export class SQLiteRuntimeStore {
   }
 
   async createSchedule(schedule: RuntimeSchedule): Promise<RuntimeSchedule> {
+    this.redactor.identifier(schedule.id);
+    this.redactor.identifier(schedule.cron);
+    this.redactor.identifier(schedule.timezone);
     const next = {
       ...schedule,
+      title: this.redactor.text(schedule.title),
       nextRunAt: schedule.nextRunAt || nextRunAt(schedule, new Date()),
     };
     await this.database.db.insert(schedules).values({
@@ -496,6 +506,8 @@ export class SQLiteRuntimeStore {
   }
 
   async updateSchedule(id: string, patch: Partial<Pick<RuntimeSchedule, "enabled" | "cron" | "timezone" | "overlapPolicy" | "nextRunAt" | "lastRunAt">>): Promise<RuntimeSchedule> {
+    this.redactor.identifier(id);
+    for (const value of Object.values(patch)) if (typeof value === "string") this.redactor.identifier(value);
     const current = (await this.readSchedules()).find((schedule) => schedule.id === id);
     if (!current) throw new Error(`Schedule not found: ${id}`);
     const next = { ...current, ...patch };
@@ -541,6 +553,7 @@ export class SQLiteRuntimeStore {
 
   async writeMemoryEntry(input: MemoryEntryInput): Promise<{ id: string; createdAt: string }> {
     guardMemoryWrite(input);
+    input = { ...input, content: this.redactor.text(input.content), metadata: this.redactor.record(input.metadata ?? {}) };
     const id = `mem-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
     const createdAt = new Date().toISOString();
     const metadataJson = JSON.stringify(input.metadata ?? {});
@@ -561,6 +574,7 @@ export class SQLiteRuntimeStore {
   }
 
   async recordFeedback(itemId: string, signal: MemoryState["recentFeedback"][number]["signal"]): Promise<void> {
+    this.redactor.identifier(itemId);
     const createdAt = new Date().toISOString();
     await this.database.db.insert(feedback).values({
       id: `fb-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
@@ -658,6 +672,8 @@ export class SQLiteRuntimeStore {
   }
 
   async saveEvalReport(report: EvalReportInput): Promise<EvalGate> {
+    this.redactor.identifier(report.id);
+    report = { ...report, name: this.redactor.text(report.name), evidence: this.redactor.text(report.evidence), evidenceData: this.redactor.record(report.evidenceData ?? {}) };
     const evidenceData = { evidence: report.evidence, ...(report.evidenceData ?? {}) };
     await this.database.db.insert(evalReports).values({
       id: report.id,
@@ -703,12 +719,14 @@ export class SQLiteRuntimeStore {
   }
 
   async recordSecurityAudit(input: Omit<SecurityAuditRecord, "id" | "createdAt"> & { id?: string; createdAt?: string }): Promise<SecurityAuditRecord> {
+    if (input.id) this.redactor.identifier(input.id);
+    if (input.runId) this.redactor.identifier(input.runId);
     const record: SecurityAuditRecord = {
       id: input.id ?? `audit-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
       ...(input.runId ? { runId: input.runId } : {}),
-      action: input.action,
+      action: this.redactor.text(input.action),
       severity: input.severity,
-      message: input.message,
+      message: this.redactor.text(input.message),
       createdAt: input.createdAt ?? new Date().toISOString(),
     };
     await this.database.db.insert(securityAudit).values({
@@ -741,12 +759,13 @@ export class SQLiteRuntimeStore {
   }
 
   async recordToolApproval(input: Omit<ToolApprovalRecord, "id" | "createdAt"> & { id?: string; createdAt?: string }): Promise<ToolApprovalRecord> {
+    if (input.id) this.redactor.identifier(input.id);
     const record: ToolApprovalRecord = {
       id: input.id ?? `approval-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
-      tool: input.tool,
+      tool: this.redactor.text(input.tool),
       risk: input.risk,
       status: input.status,
-      reason: input.reason,
+      reason: this.redactor.text(input.reason),
       createdAt: input.createdAt ?? new Date().toISOString(),
     };
     await this.database.db.insert(toolApprovals).values(record);
@@ -767,6 +786,7 @@ export class SQLiteRuntimeStore {
 
   async insertContentItems(items: DeliveredContentItem[]): Promise<void> {
     if (items.length === 0) return;
+    items = items.map((item) => ({ ...item, id: this.redactor.identifier(item.id), runId: this.redactor.identifier(item.runId), title: this.redactor.text(item.title), source: this.redactor.text(item.source), ...(item.url ? { url: this.redactor.text(item.url) } : {}), summary: this.redactor.text(item.summary), reason: this.redactor.text(item.reason), evidence: item.evidence.map(this.redactor.text) }));
     await this.database.db.insert(contentItems).values(items.map((item) => ({
       id: item.id,
       runId: item.runId,
@@ -1053,18 +1073,19 @@ function tag(block: string, name: string): string | undefined {
 
 async function fetchContentSource(source: ContentSource, options: ContentPipelineOptions): Promise<RawContentItem[]> {
   if (source.kind === "mock") return source.items ?? defaultContentSources()[0]?.items ?? [];
+  const network = options.network ?? new SafeNetwork({ allowlist: [] });
   if (source.kind === "url") {
     if (!source.url) throw new Error(`URL source requires url: ${source.id}`);
-    const response = await (options.fetch ?? fetch)(source.url);
-    if (!response.ok) throw new Error(`URL fetch failed for ${source.id}: ${response.status}`);
-    const text = await response.text();
-    return [{ source: source.id, title: source.query ?? source.url, url: source.url, text }];
+    const response = await network.read(source.url, { signal: options.signal });
+    if (response.status < 200 || response.status >= 300) throw new Error(`URL fetch failed for ${source.id}: ${response.status}`);
+    const text = new TextDecoder().decode(response.body);
+    return [{ source: source.id, title: source.query ?? response.url, url: response.url, text }];
   }
   if (source.kind === "rss") {
     if (!source.url) throw new Error(`RSS source requires url: ${source.id}`);
-    const response = await (options.fetch ?? fetch)(source.url);
-    if (!response.ok) throw new Error(`RSS fetch failed for ${source.id}: ${response.status}`);
-    const xml = await response.text();
+    const response = await network.read(source.url, { signal: options.signal });
+    if (response.status < 200 || response.status >= 300) throw new Error(`RSS fetch failed for ${source.id}: ${response.status}`);
+    const xml = new TextDecoder().decode(response.body);
     return [...xml.matchAll(/<item[\s\S]*?<\/item>|<entry[\s\S]*?<\/entry>/gi)].slice(0, 20).map((match) => ({
       source: source.id,
       title: tag(match[0], "title") ?? "Untitled",
@@ -1073,8 +1094,8 @@ async function fetchContentSource(source: ContentSource, options: ContentPipelin
       publishedAt: tag(match[0], "pubDate") ?? tag(match[0], "updated"),
     }));
   }
-  if (!source.url || !options.browser) throw new Error(`Browser source requires url and browser adapter: ${source.id}`);
-  const page = await options.browser.read(source.url);
+  if (!source.url) throw new Error(`Browser source requires url: ${source.id}`);
+  const page = await readBrowserSource(network, source.url, { signal: options.signal });
   const links = page.links?.filter((link) => link.text.trim().length > 8).slice(0, 8) ?? [];
   return links.length > 0
     ? links.map((link) => ({ source: source.id, title: link.text, url: link.url ?? page.url, text: `${link.text}\n${page.text}` }))
@@ -1082,6 +1103,7 @@ async function fetchContentSource(source: ContentSource, options: ContentPipelin
 }
 
 export async function runContentPipeline(store: RuntimeEventStore, runId: string, options: ContentPipelineOptions = {}): Promise<DeliveredContentItem[]> {
+  options = { ...options, network: options.network ?? (store instanceof SQLiteRuntimeStore ? store.network : undefined) };
   const sources = options.sources ?? defaultContentSources();
   const emit = async (type: RuntimeEventType, payload: Record<string, unknown>, eventOptions?: { severity?: Severity }) => {
     await store.appendEvent(store.createEvent(runId, type, payload, { source: "content-pipeline", severity: eventOptions?.severity }));

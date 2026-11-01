@@ -60,7 +60,7 @@ function MetricTile(props: { label: string; value: string; detail: string; tone?
   );
 }
 
-function Cockpit(props: { snapshot: RuntimeSnapshot; onRunNow: () => void; isRunning: boolean }) {
+function Cockpit(props: { snapshot: RuntimeSnapshot; onRunNow: () => void; isRunning: boolean; canOperate: boolean }) {
   const run = props.snapshot.latestRun;
   return (
     <section className="cockpit">
@@ -74,7 +74,7 @@ function Cockpit(props: { snapshot: RuntimeSnapshot; onRunNow: () => void; isRun
         </div>
       </div>
       <div className="cockpitControls">
-        <button className="primaryButton" onClick={props.onRunNow} disabled={props.isRunning}>
+        <button className="primaryButton" onClick={props.onRunNow} disabled={props.isRunning || !props.canOperate} title={props.canOperate ? undefined : "Operator permission required"}>
           {props.isRunning ? "Starting..." : "Run now"}
         </button>
         <div className="runSummary">
@@ -324,7 +324,7 @@ function EmptyState(props: { title: string; detail: string }) {
   );
 }
 
-export function App() {
+export function App({ canOperate }: { canOperate: boolean }) {
   const queryClient = useQueryClient();
   const snapshot = useQuery<RuntimeSnapshot, Error>({ queryKey: snapshotKey, queryFn: fetchSnapshot, refetchInterval: 10_000 });
   const runNowMutation = useMutation({
@@ -379,7 +379,7 @@ export function App() {
 
   return (
     <main className="shell">
-      <Cockpit snapshot={data} onRunNow={() => runNowMutation.mutate()} isRunning={runNowMutation.isPending} />
+      <Cockpit snapshot={data} onRunNow={() => runNowMutation.mutate()} isRunning={runNowMutation.isPending} canOperate={canOperate} />
       {runNowMutation.isError ? <div className="alert">Run now failed: {runNowMutation.error.message}</div> : null}
       {scheduleMutation.isError ? <div className="alert">Schedule update failed: {scheduleMutation.error.message}</div> : null}
 
@@ -391,7 +391,7 @@ export function App() {
         </Card>
 
         <Card title="Scheduler" eyebrow="Triggers" action={<span className="countBadge">{data.schedules.length}</span>}>
-          <Scheduler schedules={data.schedules} triggerReasons={triggerReasons} onToggle={(schedule) => scheduleMutation.mutate(schedule)} isPending={scheduleMutation.isPending} />
+          <Scheduler schedules={data.schedules} triggerReasons={triggerReasons} onToggle={(schedule) => scheduleMutation.mutate(schedule)} isPending={scheduleMutation.isPending || !canOperate} />
         </Card>
 
         <Card title="Content Pipeline" eyebrow={`${pipelineCount} events`}>

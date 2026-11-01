@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { App } from "./App.js";
+import { AuthGate } from "./AuthGate.js";
 import "./styles.css";
 
 const queryClient = new QueryClient({
@@ -20,7 +20,7 @@ if (!root) throw new Error("Dashboard root element is missing");
 createRoot(root).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <AuthGate />
     </QueryClientProvider>
   </StrictMode>,
 );

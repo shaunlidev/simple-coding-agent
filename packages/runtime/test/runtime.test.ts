@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { SafeNetwork } from "@simple-coding-agent/security";
 import { nextRunAt, runContentPipeline, runDemoAgent, RuntimeScheduler, SQLiteRuntimeStore, type RuntimeEvent, type RuntimeSchedule } from "../src/index.ts";
 
 test("sqlite runtime projects a complete agent ops snapshot from append-only events", async () => {
@@ -194,7 +195,7 @@ test("content pipeline dedupes, merges similar items, persists evidence, and tol
       },
       { id: "broken-rss", kind: "rss", url: "https://example.test/rss.xml" },
     ],
-    fetch: async () => ({ ok: false, status: 503, text: async () => "" }) as Response,
+    network: new SafeNetwork({ allowlist: ["https://example.test"], resolve: async () => [{ address: "93.184.216.34", family: 4 }], transport: async ({ url }) => ({ url: url.href, status: 503, headers: {}, body: new Uint8Array() }) }),
   });
   await store.appendEvent(store.createEvent(runId, "run.completed", { durationMs: 1 }, { source: "orchestrator" }));
   const snapshot = await store.snapshot();
@@ -218,7 +219,7 @@ test("content pipeline fails only when every source fails", async () => {
   await assert.rejects(
     () => runContentPipeline(store, "run-all-failed", {
       sources: [{ id: "broken-url", kind: "url", url: "https://example.test/unavailable" }],
-      fetch: async () => ({ ok: false, status: 500, text: async () => "" }) as Response,
+      network: new SafeNetwork({ allowlist: ["https://example.test"], resolve: async () => [{ address: "93.184.216.34", family: 4 }], transport: async ({ url }) => ({ url: url.href, status: 500, headers: {}, body: new Uint8Array() }) }),
     }),
     /All content sources failed/,
   );

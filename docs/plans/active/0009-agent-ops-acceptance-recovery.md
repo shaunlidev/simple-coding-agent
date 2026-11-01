@@ -1,6 +1,6 @@
 # 0009 Agent Ops 验收整改计划
 
-状态：用户已批准持续推进。R1 验收通过（证据见 `docs/evidence/R1-clean-build.md`），其余批次待开始。各批次仍须单独提交并核对远程后再进入下一批。
+状态：用户已批准持续推进。R1 已验收并推送 `98501c5`。R2 验收通过，进入独立提交和远端 SHA 核对，见 `docs/evidence/R2-security-boundaries.md`；R3-R10 待开始。
 
 复核日期：2026-11-01。代码基线：`797ccb8`。
 
@@ -50,7 +50,7 @@
 | 批次 | 交付结果 | 对应原 Phase | 主要代码范围 | 当前状态 |
 | --- | --- | --- | --- | --- |
 | R1 | 干净环境可以安装、构建和启动 | 0、1、10 | package manifests、Docker、CI、README | 验收通过 |
-| R2 | 服务端权限、工具审批和网络限制生效 | 3、10 | security、server、工具执行入口 | 待开始 |
+| R2 | 服务端权限、工具审批和网络限制生效 | 3、10 | security、server、工具执行入口 | 验收通过，待提交核对 |
 | R3 | run、内容、投递和事件状态一致 | 2、6 | db、runtime | 待开始 |
 | R4 | Dashboard 运行真实 agent 与内容流程 | 3、6 | runtime、server、已有 ai/agent 组合 | 待开始 |
 | R5 | 定时、排队、取消和重启恢复正确 | 5 | runtime、server | 待开始 |

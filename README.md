@@ -184,6 +184,31 @@ Supported first-pass sources are `mock`, `browser`, and `rss`. Browser sources r
 
 The dashboard is a real Agent Ops control plane for a personalized content agent. It is not a spec or README showcase. The locked production-shaped stack is Fastify, React/Vite, TanStack Query, SQLite, Drizzle ORM, node-cron, SSE, Playwright, and the existing DeepSeek provider.
 
+### Dashboard Access
+
+Dashboard API access now requires a server-side session. Configure identities in the project-root `.env` before signing in. Generate separate random values for the session signing secret and each user's access secret:
+
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+
+Configuration shape (replace the placeholders with generated values):
+
+```dotenv
+AGENT_SESSION_SECRET=<random-session-secret>
+AGENT_AUTH_USERS='[{"id":"owner","role":"operator","secret":"<random-operator-secret>"},{"id":"guest","role":"viewer","secret":"<random-viewer-secret>"}]'
+AGENT_PUBLIC_ORIGIN=http://127.0.0.1:4175
+AGENT_CORS_ORIGIN=http://127.0.0.1:4176
+```
+
+Each secret must contain at least 32 characters. Keep these values out of version control. Existing DeepSeek settings are unchanged. An empty user list does not enable anonymous access. Restart the server after changing identities; removing a user or rotating their credential invalidates their sessions.
+
+Operators can run tasks and change state; viewers can read the workspace. Sessions expire after eight hours. Browser requests use an HttpOnly SameSite cookie and a session-bound CSRF token. Production cookies additionally require HTTPS. `AGENT_TRUST_PROXY=1` trusts only a loopback reverse proxy, not arbitrary forwarded headers; the deployment proxy topology still needs R10 validation.
+
+Memory clearing now requires a server-recorded approval. Request `/api/security/approvals` with `{runId, tool: "memory_clear", args: {confirmation: "clear-memory"}}`, approve its ID through `/api/security/approvals/:id/approve`, then execute the bound operation once. These are authenticated operator requests with CSRF. A policy check is informational and never creates an execution approval. Full approval controls in the dashboard are part of R8.
+
+R2 security gates now cover authenticated API/SSE/export, bound single-use approvals, validated and pinned outbound HTTP, browser subrequest restrictions, and redaction before new persistence/log writes. See [R2 evidence](docs/evidence/R2-security-boundaries.md) for results and residual risks. This does not scrub historical databases or provide a multi-tenant execution sandbox. R3-R10 and cloud release acceptance remain open; do not expose this branch as a production service.
+
 Initialize the local database:
 
 ```bash

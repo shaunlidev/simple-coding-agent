@@ -33,7 +33,21 @@ RUN_BROWSER_LIVE=1 npm run test:live
 
 The browser live eval starts a local social-style HTML feed, collects it through the task runtime's browser source, and verifies the generated digest. It is opt-in because it requires Playwright and a local browser install.
 
-## Test Layers
+## R2 Security Acceptance
+
+After `npm run build` and `npm run dashboard:build`:
+
+```bash
+node scripts/verify-auth.mjs
+RUN_BROWSER_LIVE=1 node --experimental-transform-types --test evals/browser-security.live.eval.ts
+docker build --platform linux/arm64 -t simple-coding-agent:r2 .
+node scripts/verify-container.mjs simple-coding-agent:r2
+npm audit --omit=dev --registry=https://registry.npmjs.org
+```
+
+These use isolated SQLite, synthetic secrets and actual Chromium. The browser security eval uses controlled HTML/transport and a real forbidden local HTTP/WebSocket listener, not a public content or live model success. The container gate uses an ephemeral self-signed HTTPS fixture and checks production cookies. It removes its container and temporary certificate afterward. Reports/screenshots are under `artifacts/acceptance/R2/`. Linux arm64 was tested; other deployment architectures need R10 validation. The production audit currently has three moderate affected packages; see the bounded exposure analysis in R2 evidence, not an assumed clean result.
+
+## Coverage
 
 - Unit tests cover pure logic and protocol contracts.
 - Faux provider tests prove test infrastructure before agent tests depend on it.

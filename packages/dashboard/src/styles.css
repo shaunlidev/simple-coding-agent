@@ -17,6 +17,15 @@ body {
   min-width: 320px;
 }
 
+.authShell { width: min(380px, 100%); margin: 64px auto; padding: 24px; }
+.authShell h1 { font-size: 28px; margin: 0 0 28px; }
+.authShell form { display: grid; gap: 12px; }
+.authShell input { width: 100%; min-width: 0; min-height: 44px; padding: 10px; border: 1px solid #64736a; border-radius: 4px; background: white; color: #17211d; }
+.authShell [role="alert"] { color: #7d211f; }
+.accountBar { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; background: white; border-bottom: 1px solid #ced8cf; }
+.accountBar span { margin-left: auto; overflow-wrap: anywhere; }
+:focus-visible { outline: 2px solid #29476d; outline-offset: 3px; }
+
 button,
 input,
 select,

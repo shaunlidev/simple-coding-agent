@@ -6,9 +6,10 @@
     "tsBuildInfoFile": "dist/.tsbuildinfo",
     "baseUrl": "../..",
     "paths": {
-      "@simple-coding-agent/db": ["packages/db/src/index.ts"]
+      "@simple-coding-agent/db": ["packages/db/src/index.ts"],
+      "@simple-coding-agent/security": ["packages/security/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "../../types/**/*.d.ts"],
-  "references": [{ "path": "../db" }]
+  "references": [{ "path": "../db" }, { "path": "../security" }]
 }

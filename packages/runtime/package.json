@@ -10,7 +10,9 @@
   },
   "dependencies": {
     "@simple-coding-agent/db": "0.1.0",
+    "@simple-coding-agent/security": "0.1.0",
     "drizzle-orm": "^0.45.2",
-    "node-cron": "^4.6.0"
+    "node-cron": "^4.6.0",
+    "playwright": "1.62.1"
   }
 }
