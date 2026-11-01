@@ -37,6 +37,8 @@ const payloadSchemas = {
   "run.completed": note,
   "run.failed": note.extend({ reason: z.string().min(1) }),
   "run.cancelled": note.extend({ reason: z.string().min(1) }),
+  "run.cancel_requested": note.extend({ reason: z.string().min(1), actor: z.string().optional() }),
+  "run.skipped": note.extend({ reason: z.string().min(1) }),
 };
 
 export type RuntimeEventType = keyof typeof payloadSchemas;

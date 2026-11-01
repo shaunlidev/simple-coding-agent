@@ -1,6 +1,6 @@
 # R4: Real Content Agent
 
-Status: implementation and pre-commit acceptance passed; exact-head verification and remote checkpoint pending. Baseline: `dd6be3be97fe42a874c269d711f5ef26c92c0518`.
+Status: accepted and pushed as `1a5d677c16ede4ed2e9f59eb37dcff74f4e17f66`; clean exact-head full-suite, actual UI/Chromium and live DeepSeek/public-source checks passed. The checkpoint is recorded in R5 evidence. Baseline: `dd6be3be97fe42a874c269d711f5ef26c92c0518`.
 
 R3 checkpoint: pushed to `fix/agent-ops-acceptance`; remote SHA matched the baseline above. `artifacts/acceptance/R3/report.json` records a clean exact-head browser/process-restart check at 2026-11-01T03:02:35.355Z. Three runs retained six per-run results and two unique deliveries, with delivered/no_new_items/no_new_items outcomes. This is demo persistence evidence, not live-model evidence.
 
@@ -15,7 +15,7 @@ R3 checkpoint: pushed to `fix/agent-ops-acceptance`; remote SHA matched the base
 - [x] Add minimal task/source configuration and inspectable real execution in Dashboard; retain full R8 UI scope.
 - [x] Verify controlled provider, parser/network/browser failures, and CLI/TUI regressions.
 - [x] Verify a bounded real DeepSeek request, a public content source and real browser collection, with redacted evidence.
-- [ ] Run full gates, record limitations, commit, rerun relevant exact-head checks, push and verify remote SHA.
+- [x] Run full gates, record limitations, commit, rerun relevant exact-head checks, push and verify remote SHA.
 
 ## Current Architecture and Changes
 

@@ -1,4 +1,4 @@
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "skipped";
 export type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped";
 
 export type RuntimeRun = {
@@ -54,6 +54,9 @@ export type RuntimeSchedule = {
   timezone: string;
   nextRunAt: string;
   lastRunAt?: string;
+  lastTrigger?: "manual" | "schedule" | "demo";
+  lastTriggerReason?: string;
+  lastScheduledFor?: string;
   overlapPolicy: "skip" | "queue" | "cancel_previous";
 };
 
@@ -215,6 +218,9 @@ export type RunDetail = {
 
 export const fetchRuns = () => requestJson<{ runs: RuntimeRun[] }>("/api/runs");
 export const fetchRun = (id: string) => requestJson<RunDetail>(`/api/runs/${encodeURIComponent(id)}`);
+export const cancelRun = (id: string) => requestJson<{ runId: string; status: RunStatus }>(`/api/runs/${encodeURIComponent(id)}/cancel`, { method: "POST", body: "{}" });
+export const createSchedule = (input: { id: string; taskId: string; title: string; cron: string; timezone: string; overlapPolicy: RuntimeSchedule["overlapPolicy"] }) => requestJson<RuntimeSchedule>("/api/schedules", { method: "POST", body: JSON.stringify(input) });
+export const runSchedule = (input: { id: string; key: string }) => requestJson<{ runId: string }>(`/api/schedules/${encodeURIComponent(input.id)}/run-now`, { method: "POST", headers: { "idempotency-key": input.key }, body: "{}" });
 
 export async function patchSchedule(id: string, patch: Partial<Pick<RuntimeSchedule, "enabled" | "cron" | "timezone" | "overlapPolicy">>): Promise<RuntimeSchedule> {
   return requestJson<RuntimeSchedule>(`/api/schedules/${encodeURIComponent(id)}`, {

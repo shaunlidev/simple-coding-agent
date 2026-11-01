@@ -14,6 +14,7 @@
     "@simple-coding-agent/ai": "0.1.0",
     "@simple-coding-agent/db": "0.1.0",
     "@simple-coding-agent/security": "0.1.0",
+    "cron-parser": "5.10.3",
     "drizzle-orm": "^0.45.2",
     "jsdom": "30.1.3",
     "node-cron": "^4.6.0",

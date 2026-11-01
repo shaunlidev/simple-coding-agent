@@ -49,6 +49,16 @@ These use isolated SQLite, synthetic secrets and actual Chromium. The browser se
 
 ## Coverage
 
+R5 after building API and Dashboard:
+
+```bash
+node --experimental-transform-types --test packages/runtime/test/schedule-time.test.ts packages/runtime/test/scheduler.test.ts packages/server/test/scheduler.test.ts
+node scripts/verify-scheduler-process.mjs
+node scripts/verify-scheduler-ui.mjs
+```
+
+The process gate launches separate actual workers, refuses a second owner, SIGKILLs the first and verifies frozen queued work/FIFO/nextRunAt after restart. Provider and source responses are controlled. The UI gate creates a schedule, begins an actual Chromium source read, cancels it, asserts transport abort/no delivery, and pauses/resumes at desktop/mobile widths. Evidence under `artifacts/acceptance/R5/` records SHA/dirty state; this is not cloud or live-model evidence. The cancelled request's remote service may already have done work; tests prove local abort, no subsequent dispatch and no local delivery.
+
 R4 after building:
 
 ```bash

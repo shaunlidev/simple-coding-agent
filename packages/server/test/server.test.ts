@@ -99,7 +99,8 @@ test("server streams snapshot and runtime events over SSE", async () => {
 });
 
 test("server scheduler tick triggers due schedule through shared run path", async () => {
-  const { app, database, request } = await createAgentOpsServer({ env: { AGENT_DB_PATH: ":memory:" } });
+  let now = new Date("2026-08-25T00:00:00Z");
+  const { app, database, request } = await createAgentOpsServer({ env: { AGENT_DB_PATH: ":memory:" }, now: () => now });
 
   await request({
     method: "POST",
@@ -110,11 +111,11 @@ test("server scheduler tick triggers due schedule through shared run path", asyn
       cron: "0 9 * * *",
       timezone: "Asia/Shanghai",
       enabled: true,
-      nextRunAt: "2026-08-25T09:00:00.000Z",
       overlapPolicy: "skip",
     },
   });
-  const tick = await request({ method: "POST", url: "/api/scheduler/tick", payload: { now: "2026-08-25T09:00:00.000Z" } });
+  now = new Date("2026-08-25T09:00:00Z");
+  const tick = await request({ method: "POST", url: "/api/scheduler/tick", payload: {} });
   const schedules = await request({ method: "GET", url: "/api/schedules" });
   const runs = await request({ method: "GET", url: "/api/runs" });
 

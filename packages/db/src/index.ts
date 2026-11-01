@@ -57,6 +57,7 @@ export const metrics = sqliteTable("metrics", {
 });
 
 export const schedules = sqliteTable("schedules", {
+  revision: integer("revision").notNull().default(1),
   id: text("id").primaryKey(),
   title: text("title").notNull(),
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
@@ -260,6 +261,22 @@ const contentTaskSchema = [
   "alter table run_content_results add column citations_json text not null default '[]'",
 ];
 
+const schedulerSchema = [
+  "alter table schedules add column revision integer not null default 1",
+  `create table scheduled_jobs (
+    seq integer primary key autoincrement, run_id text not null unique,
+    scope_key text not null, request_target text not null, schedule_id text references schedules(id), schedule_revision integer,
+    trigger text not null check(trigger in ('manual','schedule','demo')),
+    scheduled_for text, admitted_at text not null, started_at text, finished_at text,
+    state text not null check(state in ('queued','running','cancelling','completed','failed','cancelled','skipped')),
+    reason text not null
+  )`,
+  "create index scheduled_jobs_pending on scheduled_jobs(state, seq)",
+  "create index scheduled_jobs_scope on scheduled_jobs(scope_key, state)",
+  "create index scheduled_jobs_history on scheduled_jobs(schedule_id, seq)",
+  "create unique index scheduled_jobs_occurrence on scheduled_jobs(schedule_id, schedule_revision, scheduled_for) where trigger = 'schedule'",
+];
+
 export function migrateSqliteDatabase(database: SqliteDatabase): void {
   const { sqlite } = database;
   const migrations = [
@@ -274,6 +291,9 @@ export function migrateSqliteDatabase(database: SqliteDatabase): void {
     } },
     { version: 3, name: "content-task-evidence-v1", statements: contentTaskSchema, apply: () => {
       for (const statement of contentTaskSchema) sqlite.exec(statement);
+    } },
+    { version: 4, name: "durable-scheduler-v1", statements: schedulerSchema, apply: () => {
+      for (const statement of schedulerSchema) sqlite.exec(statement);
     } },
   ];
   sqlite.transaction(() => {

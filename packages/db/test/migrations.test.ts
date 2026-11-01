@@ -35,7 +35,7 @@ for (const withEvidence of [false, true]) {
       ]);
       migrateSqliteDatabase(database);
       assert.deepEqual(database.sqlite.prepare("select * from run_content_results").all(), before);
-      assert.equal(database.sqlite.prepare("select * from schema_migrations").all().length, 3);
+      assert.equal(database.sqlite.prepare("select * from schema_migrations").all().length, 4);
       assert.deepEqual(database.sqlite.pragma("foreign_key_check"), []);
     } finally { database.sqlite.close(); }
   });
@@ -68,9 +68,9 @@ test("R3.5 unknown migration versions and changed checksums fail closed", () => 
   const database = createSqliteDatabase();
   try {
     migrateSqliteDatabase(database);
-    database.sqlite.prepare("insert into schema_migrations values (4, 'future', 'future', '2026-11-01')").run();
+    database.sqlite.prepare("insert into schema_migrations values (5, 'future', 'future', '2026-11-01')").run();
     assert.throws(() => migrateSqliteDatabase(database), /Unsupported/);
-    database.sqlite.prepare("delete from schema_migrations where version = 4").run();
+    database.sqlite.prepare("delete from schema_migrations where version = 5").run();
     database.sqlite.prepare("update schema_migrations set checksum = 'changed' where version = 2").run();
     assert.throws(() => migrateSqliteDatabase(database), /checksum mismatch/);
   } finally { database.sqlite.close(); }

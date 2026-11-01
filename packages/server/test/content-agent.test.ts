@@ -37,7 +37,8 @@ test("R4 real-mode API requires configuration and missing credentials never use 
 
 test("R4 manual and scheduled tasks use the same Agent executor and frozen task; retries do not repeat paid calls", async () => {
   let calls = 0;
-  const server = await createAuthenticatedServer({ env: { AGENT_DEMO_MODE: "0" }, network: network(), providerFactory: (task) => createDeepSeekProvider({
+  let now = new Date();
+  const server = await createAuthenticatedServer({ env: { AGENT_DEMO_MODE: "0" }, now: () => now, network: network(), providerFactory: (task) => createDeepSeekProvider({
     apiKey: "fixture", model: task.model, maxOutputTokens: task.limits.maxOutputTokens,
     fetch: async (_url, init) => {
       calls++;
@@ -59,7 +60,8 @@ test("R4 manual and scheduled tasks use the same Agent executor and frozen task;
     assert.equal((await server.request(request)).json().runId, first.run.id);
     assert.equal(calls, 2);
     assert.equal((await server.request({ method: "POST", url: "/api/schedules", payload: { id: "schedule", taskId: "real-task", title: "Scheduled research", cron: "@every 1h", timezone: "UTC" } })).statusCode, 200);
-    const tick = await server.request({ method: "POST", url: "/api/scheduler/tick", payload: { now: new Date(Date.now() + 1000).toISOString() } });
+    now = new Date(now.getTime() + 3_600_000);
+    const tick = await server.request({ method: "POST", url: "/api/scheduler/tick", payload: {} });
     const scheduled = await completed(server, tick.json().results[0].runId);
     assert.equal(scheduled.run.trigger, "schedule");
     assert.equal(scheduled.run.status, "completed");

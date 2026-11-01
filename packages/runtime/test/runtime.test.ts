@@ -108,7 +108,7 @@ test("scheduler triggers due schedules and ignores paused schedules", async () =
     nextRunAt: "2026-08-25T09:00:00.000Z",
     overlapPolicy: "skip",
   });
-  const scheduler = new RuntimeScheduler({ runtime: store });
+  const scheduler = new RuntimeScheduler({ runtime: store, now: () => new Date("2026-08-25T09:00:00.000Z") });
 
   const results = await scheduler.tick(new Date("2026-08-25T09:00:00.000Z"));
   const runs = await store.listRuns();
@@ -126,8 +126,9 @@ test("scheduler triggers due schedules and ignores paused schedules", async () =
 test("scheduler overlap policies skip, queue, and cancel_previous", async () => {
   const store = new SQLiteRuntimeStore();
   const pendingResolvers = new Map<string, () => void>();
-  const runAgent = ({ runId }: { runId: string; schedule: RuntimeSchedule }) => new Promise<string>((resolve) => {
+  const runAgent = ({ runId, signal }: { runId: string; signal: AbortSignal }) => new Promise<string>((resolve) => {
     pendingResolvers.set(runId, () => resolve(runId));
+    signal.addEventListener("abort", () => resolve(runId), { once: true });
   });
   const scheduler = new RuntimeScheduler({ runtime: store, runAgent, now: () => new Date("2026-08-25T09:00:00.000Z") });
   for (const overlapPolicy of ["skip", "queue", "cancel_previous"] as const) {
@@ -144,18 +145,28 @@ test("scheduler overlap policies skip, queue, and cancel_previous", async () => 
 
   const skipRun = await scheduler.runNow("skip-brief");
   await assert.rejects(() => scheduler.runNow("skip-brief"), /overlap_skip/);
+  pendingResolvers.get(skipRun)?.();
+  await scheduler.idle();
 
   const queueRun = await scheduler.runNow("queue-brief");
-  await assert.rejects(() => scheduler.runNow("queue-brief"), /overlap_queue/);
+  const queuedRun = await scheduler.runNow("queue-brief");
+  assert.equal((await store.projectRun(queuedRun)).status, "queued");
+  pendingResolvers.get(queueRun)?.();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  pendingResolvers.get(queuedRun)?.();
+  await scheduler.idle();
 
   const cancelRun = await scheduler.runNow("cancel_previous-brief");
   const replacementRun = await scheduler.runNow("cancel_previous-brief");
+  await new Promise((resolve) => setTimeout(resolve, 0));
 
   pendingResolvers.get(skipRun)?.();
   pendingResolvers.get(queueRun)?.();
   pendingResolvers.get(cancelRun)?.();
   pendingResolvers.get(replacementRun)?.();
   await new Promise((resolve) => setTimeout(resolve, 0));
+  await scheduler.idle();
+  await scheduler.stop();
 
   const events = await store.listEvents();
   assert.equal(events.some((event) => event.payload.reason === "overlap_skip"), true);

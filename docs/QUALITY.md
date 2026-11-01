@@ -26,8 +26,8 @@ The existing dashboard and deployment checks inspect build output and file text.
 | Dependency advisories | Three moderate affected packages in unused glob/minimatch static enumeration path; no high/critical in official production audit | R2 triage; re-audit R10 |
 | Historical secrets | New writes/outputs are redacted; existing databases are not retroactively scrubbed | R3 migration / R10 release |
 | Legacy history completeness | R3 retains surviving rows and explicitly marks old receipts incomplete; previously discarded results cannot be recovered from count-only events | R3 evidence; R10 backup/release |
-| Real dashboard agent | R4 controlled UI/browser and actual DeepSeek/public-source gates passed; exact-commit checkpoint pending | R4 evidence |
-| Schedule semantics | Host timezone affects execution; cancellation does not stop the old task | R5 |
+| Real dashboard agent | R4 controlled UI/browser and actual DeepSeek/public-source gates passed at exact pushed SHA `1a5d677` | R4/R5 checkpoint evidence |
+| Schedule semantics | R5 timezone, durable queue, actual cancellation and real process restart/UI gates pass; exact-commit checkpoint pending | R5 evidence |
 | Memory and practices | FTS storage exists, but use in model context and practice activation need verification | R6 |
 | Honest telemetry | Real content events now contain actual usage; legacy demo metrics/default eval and security projections still require replacement | R7, R9 |
 | User workflows | UI lacks the complete configuration, feedback, and inspection flows | R8 |
@@ -35,7 +35,7 @@ The existing dashboard and deployment checks inspect build output and file text.
 
 Record new regression coverage against behavior. A missing or skipped measurement remains unverified.
 
-R3's normalized results, unique inbox ledger, request idempotency and transactional terminal events pass repeat/concurrent/restart/rollback checks. Actual process-restart and desktop/mobile history verification passed. R4's real executor extends that transaction with current-run citation checks and frozen task/source evidence. The first live attempt correctly failed on fake-IP DNS; the subsequent explicitly configured trusted-DNS run passed with actual provider usage. Legacy bytes in existing databases/backups are not retroactively scrubbed. Old orphaned run recovery remains in R5; a same-key retry does not silently execute it again.
+R3's normalized results, unique inbox ledger, request idempotency and transactional terminal events pass repeat/concurrent/restart/rollback checks. Actual process-restart and desktop/mobile history verification passed. R4's real executor extends that transaction with current-run citation checks and frozen task/source evidence. The first live attempt correctly failed on fake-IP DNS; the subsequent explicitly configured trusted-DNS run passed with actual provider usage. R5 preserves frozen queued work, fails interrupted attempts and prevents cancelled delivery. A process-held SQLite lock is tested on local storage, not on network/distributed storage. Legacy bytes in existing databases/backups are not retroactively scrubbed.
 
 The default suite still reports two keyless DeepSeek tests as passed because those tests return early. They are NOT live model evidence; explicit skip reporting is required in R9. Existing bundle-word and deployment-file checks remain only static evidence, alongside the new actual R1/R2 browser/container gates.
 

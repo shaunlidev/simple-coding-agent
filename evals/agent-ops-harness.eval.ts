@@ -9,7 +9,6 @@ import {
   type EvalReportInput,
   type RuntimeEventType,
   type RuntimeEvent,
-  type RuntimeSchedule,
 } from "../packages/runtime/src/index.ts";
 
 async function saveGate(store: SQLiteRuntimeStore, report: EvalReportInput): Promise<void> {
@@ -38,7 +37,7 @@ test("agent ops harness stores release-gate eval reports with trace evidence", a
   const pendingResolvers = new Map<string, () => void>();
   const scheduler = new RuntimeScheduler({
     runtime: store,
-    runAgent: ({ runId }: { runId: string; schedule: RuntimeSchedule }) => new Promise<string>((resolve) => {
+    runAgent: ({ runId }) => new Promise<string>((resolve) => {
       pendingResolvers.set(runId, () => resolve(runId));
     }),
     now: () => new Date("2026-08-25T09:00:00.000Z"),
@@ -55,6 +54,8 @@ test("agent ops harness stores release-gate eval reports with trace evidence", a
   const overlapRun = await scheduler.runNow("harness-overlap");
   await assert.rejects(() => scheduler.runNow("harness-overlap"), /overlap_skip/);
   pendingResolvers.get(overlapRun)?.();
+  await scheduler.idle();
+  await scheduler.stop();
   const overlapEvents = await store.listEvents();
   await saveGate(store, {
     id: "scheduler-overlap",

@@ -8,8 +8,17 @@ function portFromArgs(): number | undefined {
   return numeric ? Number(numeric) : process.env.PORT ? Number(process.env.PORT) : undefined;
 }
 
-const { app } = await createAgentOpsServer({ logger: true, startScheduler: true });
+const { app, database } = await createAgentOpsServer({ logger: true, startScheduler: true });
 const env = parseEnvironment(process.env);
 const port = portFromArgs() || env.AGENT_SERVER_PORT;
 await app.listen({ host: env.AGENT_SERVER_HOST, port });
-console.log(`Agent Ops API running at http://${env.AGENT_SERVER_HOST}:${port}`);
+process.stdout.write(`Agent Ops API running at http://${env.AGENT_SERVER_HOST}:${port}\n`);
+let closing = false;
+async function shutdown() {
+  if (closing) return;
+  closing = true;
+  try { await app.close(); database.sqlite.close(); }
+  catch { process.stderr.write("Agent Ops shutdown failed\n"); process.exitCode = 1; }
+}
+process.on("SIGTERM", () => { void shutdown(); });
+process.on("SIGINT", () => { void shutdown(); });

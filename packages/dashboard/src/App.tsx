@@ -2,8 +2,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchRun, fetchRuns, fetchSnapshot, patchSchedule, runNow, type DeliveredContentItem, type EvalGate, type RuntimeEvent, type RuntimeSchedule, type RuntimeSnapshot, type RuntimeSpan, type RuntimeStep } from "./api.js";
-import { fetchTasks } from "./api.js";
+import { fetchTasks, cancelRun, runSchedule } from "./api.js";
 import { TaskConfig } from "./TaskConfig.js";
+import { ScheduleConfig } from "./ScheduleConfig.js";
 
 const snapshotKey = ["runtime-snapshot"] as const;
 
@@ -11,9 +12,10 @@ function formatNumber(value: number, options: Intl.NumberFormatOptions = {}) {
   return new Intl.NumberFormat("en", options).format(value);
 }
 
-function formatTime(value?: string) {
+function formatTime(value?: string, timezone?: string) {
   if (!value) return "Not recorded";
   return new Intl.DateTimeFormat("en", {
+    ...(timezone ? { timeZone: timezone } : {}),
     month: "short",
     day: "2-digit",
     hour: "2-digit",
@@ -191,17 +193,19 @@ function ContentItem(props: { item: DeliveredContentItem }) {
   );
 }
 
-function Scheduler(props: { schedules: RuntimeSchedule[]; triggerReasons: Map<string, string>; onToggle: (schedule: RuntimeSchedule) => void; isPending: boolean }) {
+function Scheduler(props: { schedules: RuntimeSchedule[]; onToggle: (schedule: RuntimeSchedule) => void; onRun: (schedule: RuntimeSchedule) => void; isPending: boolean }) {
   return (
     <div className="scheduleList">
       {props.schedules.map((schedule) => (
         <article className="scheduleRow" key={schedule.id}>
           <div>
             <strong>{schedule.title}</strong>
-            <small>{schedule.cron} · {schedule.timezone} · next {formatTime(schedule.nextRunAt)}</small>
-            <small>last {formatTime(schedule.lastRunAt)} · trigger {props.triggerReasons.get(schedule.id) ?? "not triggered yet"}</small>
+            <small>{schedule.cron} · {schedule.timezone} · next <time dateTime={schedule.nextRunAt}>{formatTime(schedule.nextRunAt, schedule.timezone)}</time></small>
+            <small>last <time dateTime={schedule.lastRunAt}>{formatTime(schedule.lastRunAt, schedule.timezone)}</time> · trigger {schedule.lastTrigger ?? "not recorded"}{schedule.lastTriggerReason && schedule.lastTriggerReason !== schedule.lastTrigger ? ` (${schedule.lastTriggerReason})` : ""}</small>
+            {schedule.lastScheduledFor ? <small>scheduled for {formatTime(schedule.lastScheduledFor, schedule.timezone)}</small> : null}
           </div>
           <div className="rowActions">
+            <button className="secondaryButton" disabled={props.isPending} onClick={() => props.onRun(schedule)}>Run schedule</button>
             <span className={`statusPill ${schedule.enabled ? "is-ok" : "is-muted"}`}>{schedule.enabled ? "enabled" : "paused"}</span>
             <button className="secondaryButton" disabled={props.isPending} onClick={() => props.onToggle(schedule)}>
               {schedule.enabled ? "Pause" : "Resume"}
@@ -330,7 +334,9 @@ function EmptyState(props: { title: string; detail: string }) {
   );
 }
 
-function RunHistory() {
+function RunHistory({ canOperate }: { canOperate: boolean }) {
+  const client = useQueryClient();
+  const cancel = useMutation({ mutationFn: cancelRun, onSuccess: async () => { await client.invalidateQueries({ queryKey: ["runtime-run"] }); await client.invalidateQueries({ queryKey: ["runtime-runs"] }); await client.invalidateQueries({ queryKey: snapshotKey }); } });
   const runs = useQuery({ queryKey: ["runtime-runs"], queryFn: fetchRuns, refetchInterval: 10_000 });
   const [selected, setSelected] = useState("");
   const id = selected || runs.data?.runs[0]?.id || "";
@@ -346,6 +352,8 @@ function RunHistory() {
     {detail.data ? <div aria-label="Historical run result">
       <p className="runIdentity">{detail.data.run.id}</p>
       <p>{detail.data.run.status} · {detail.data.result?.deliveredCount ?? 0} delivered</p>
+      {canOperate && ["queued", "running", "cancelling"].includes(detail.data.run.status) ? <button disabled={cancel.isPending || detail.data.run.status === "cancelling"} onClick={() => cancel.mutate(detail.data.run.id)}>{detail.data.run.status === "cancelling" ? "Cancelling..." : "Cancel run"}</button> : null}
+      {cancel.isError ? <p role="alert">{cancel.error.message}</p> : null}
       {detail.data.result?.outcome === "no_new_items" ? <p role="status">No new items</p> : null}
       {detail.data.result?.outcome === "legacy_incomplete" ? <p role="status">Legacy results may be incomplete.</p> : null}
       {detail.data.result?.items.map((item) => <ContentItem key={item.id} item={item} />)}
@@ -362,6 +370,7 @@ export function App({ canOperate }: { canOperate: boolean }) {
   const pendingRunKey = useRef<string | undefined>(undefined);
   const [selectedTask, setSelectedTask] = useState("");
   const tasks = useQuery({ queryKey: ["content-tasks"], queryFn: fetchTasks });
+  const scheduledRun = useMutation({ mutationFn: runSchedule, onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: snapshotKey }); await queryClient.invalidateQueries({ queryKey: ["runtime-runs"] }); } });
   const taskId = selectedTask || tasks.data?.tasks[0]?.definition.id;
   const snapshot = useQuery<RuntimeSnapshot, Error>({ queryKey: snapshotKey, queryFn: fetchSnapshot, refetchInterval: 10_000 });
   const runNowMutation = useMutation({
@@ -400,16 +409,6 @@ export function App({ canOperate }: { canOperate: boolean }) {
 
   const data: RuntimeSnapshot | undefined = snapshot.data;
   const pipelineCount = useMemo(() => data?.events.filter((event) => event.type.startsWith("pipeline.")).length ?? 0, [data]);
-  const triggerReasons = useMemo(() => {
-    const reasons = new Map<string, string>();
-    for (const event of data?.events ?? []) {
-      if (event.type !== "scheduler.task_due") continue;
-      const scheduleId = typeof event.payload.scheduleId === "string" ? event.payload.scheduleId : typeof event.payload.taskId === "string" ? event.payload.taskId : undefined;
-      if (!scheduleId || reasons.has(scheduleId)) continue;
-      reasons.set(scheduleId, String(event.payload.reason ?? event.payload.trigger ?? event.payload.action ?? "manual"));
-    }
-    return reasons;
-  }, [data]);
 
   if (snapshot.isLoading) {
     return <main className="shell"><EmptyState title="Loading runtime" detail="Connecting to the Agent Ops API." /></main>;
@@ -440,14 +439,16 @@ export function App({ canOperate }: { canOperate: boolean }) {
 
       <div className="layoutGrid">
         <Card title="Runs">
-          <RunHistory />
+          <RunHistory canOperate={canOperate} />
         </Card>
         <Card title="Run Trace" eyebrow={data.latestRun?.id ?? "No run selected"}>
           {data.steps.length > 0 ? <Steps steps={data.steps} /> : <EmptyState title="No steps yet" detail="Run the agent to populate the trace." />}
         </Card>
 
         <Card title="Scheduler" eyebrow="Triggers" action={<span className="countBadge">{data.schedules.length}</span>}>
-          <Scheduler schedules={data.schedules} triggerReasons={triggerReasons} onToggle={(schedule) => scheduleMutation.mutate(schedule)} isPending={scheduleMutation.isPending || !canOperate} />
+          <ScheduleConfig tasks={tasks.data?.tasks ?? []} canOperate={canOperate} />
+          {scheduledRun.isError ? <p role="alert">{scheduledRun.error.message}</p> : null}
+          <Scheduler schedules={data.schedules} onToggle={(schedule) => scheduleMutation.mutate(schedule)} onRun={(schedule) => scheduledRun.mutate({ id: schedule.id, key: crypto.randomUUID() })} isPending={scheduleMutation.isPending || scheduledRun.isPending || !canOperate} />
         </Card>
 
         <Card title="Content Pipeline" eyebrow={`${pipelineCount} events`}>

@@ -17,15 +17,15 @@ const systemPrompt = [
 ].join("\n");
 
 export async function executeContentRun(store: SQLiteRuntimeStore, runId: string, options: {
-  providerFactory: ContentProviderFactory; signal?: AbortSignal;
+  providerFactory: ContentProviderFactory; signal?: AbortSignal; alreadyStarted?: boolean;
   browser?: Parameters<typeof collectContentSource>[0]["browser"];
 }): Promise<string> {
   const snapshot = store.readRunTask(runId);
   if (!snapshot) throw new Error("Run has no frozen content task");
   const task = snapshot.definition;
   const initial = await store.projectRun(runId);
-  if (initial.status !== "queued") throw new Error("Content run has already started or terminated");
-  await store.appendEvent(store.createEvent(runId, "run.started", { taskId: task.id, title: task.title, trigger: initial.trigger, mode: "live", taskRevision: snapshot.revision }));
+  if (initial.status !== (options.alreadyStarted ? "running" : "queued")) throw new Error("Content run has already started or terminated");
+  if (!options.alreadyStarted) await store.appendEvent(store.createEvent(runId, "run.started", { taskId: task.id, title: task.title, trigger: initial.trigger, mode: "live", taskRevision: snapshot.revision }));
   const deadline = new AbortController();
   const timeout = setTimeout(() => deadline.abort(new Error("Content run deadline exceeded")), task.limits.runTimeoutMs);
   const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
@@ -45,6 +45,7 @@ export async function executeContentRun(store: SQLiteRuntimeStore, runId: string
       parameters: { type: "object", properties: { sourceId: { type: "string" } }, required: ["sourceId"], additionalProperties: false },
       async execute(args) {
         signal.throwIfAborted();
+        store.assertRunExecutable(runId);
         const { sourceId } = sourceArguments.parse(args);
         const source = task.sources.find((candidate) => candidate.id === sourceId);
         if (!source) {

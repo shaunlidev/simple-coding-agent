@@ -5,7 +5,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RuntimeScheduler, SQLiteRuntimeStore, contentTaskSchema, executeContentRun, type ContentProviderFactory, type RuntimeSchedule } from "@simple-coding-agent/runtime";
+import { RuntimeScheduler, SQLiteRuntimeStore, contentTaskSchema, executeContentRun, nextRunAt, type ContentProviderFactory, type RuntimeSchedule } from "@simple-coding-agent/runtime";
 import { createDeepSeekProvider } from "@simple-coding-agent/ai";
 import { SafeNetwork, createCloudflareResolver, createRedactor, evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
 import { z } from "zod";
@@ -17,6 +17,7 @@ export type AgentOpsServerOptions = {
   logger?: boolean;
   logStream?: { write: (message: string) => void };
   startScheduler?: boolean;
+  now?: () => Date;
   dashboardRoot?: string;
   providerFactory?: ContentProviderFactory;
   network?: SafeNetwork;
@@ -29,23 +30,18 @@ const createScheduleSchema = z.object({
   cron: z.string().min(1),
   timezone: z.string().min(1).default("Asia/Shanghai"),
   enabled: z.boolean().default(true),
-  nextRunAt: z.string().min(1).optional(),
   overlapPolicy: z.enum(["skip", "queue", "cancel_previous"]).default("skip"),
-});
+}).strict();
 
 const patchScheduleSchema = z.object({
   taskId: z.string().min(1).optional(),
   enabled: z.boolean().optional(),
   cron: z.string().min(1).optional(),
   timezone: z.string().min(1).optional(),
-  nextRunAt: z.string().min(1).optional(),
-  lastRunAt: z.string().min(1).optional(),
   overlapPolicy: z.enum(["skip", "queue", "cancel_previous"]).optional(),
-});
+}).strict();
 
-const schedulerTickSchema = z.object({
-  now: z.string().datetime().optional(),
-});
+const schedulerTickSchema = z.object({}).strict();
 
 const feedbackSchema = z.object({
   itemId: z.string().min(1),
@@ -99,21 +95,11 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   const urlAllowlist = parseUrlAllowlist(env.AGENT_URL_ALLOWLIST);
   if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
   const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH, network: options.network ?? new SafeNetwork({ allowlist: urlAllowlist, ...(env.AGENT_DNS_MODE === "cloudflare" ? { resolve: createCloudflareResolver() } : {}) }), secrets: [env.DEEPSEEK_API_KEY ?? "", env.AGENT_SESSION_SECRET ?? "", ...users.map((user) => user.secret)] });
-  const active = new Map<string, { controller: AbortController; completion: Promise<string> }>();
   const providerFactory: ContentProviderFactory = options.providerFactory ?? ((task) => {
     if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY is required for real content runs");
     return createDeepSeekProvider({ apiKey: env.DEEPSEEK_API_KEY, model: task.model, stream: true, maxOutputTokens: task.limits.maxOutputTokens, responseFormat: "json_object", toolChoice: "required" });
   });
-  function startExecution(runId: string): Promise<string> {
-    const existing = active.get(runId);
-    if (existing) return existing.completion;
-    const controller = new AbortController();
-    const completion = executeContentRun(runtime, runId, { providerFactory, signal: controller.signal });
-    active.set(runId, { controller, completion });
-    void completion.then(() => active.delete(runId), () => active.delete(runId));
-    return completion;
-  }
-  const scheduler = new RuntimeScheduler({ runtime, ...(env.AGENT_DEMO_MODE === "1" ? {} : { runAgent: ({ runId }: { runId: string }) => startExecution(runId) }) });
+  const scheduler = new RuntimeScheduler({ runtime, now: options.now, ...(env.AGENT_DEMO_MODE === "1" ? {} : { runAgent: ({ runId, signal }: { runId: string; signal: AbortSignal }) => executeContentRun(runtime, runId, { providerFactory, signal, alreadyStarted: true }) }) });
   const app = Fastify({
     logger: options.logger ? {
       ...(options.logStream ? { stream: options.logStream } : {}),
@@ -185,10 +171,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
 
   if (options.startScheduler) scheduler.start();
   app.addHook("onClose", async () => {
-    scheduler.stop();
-    const jobs = [...active.values()];
-    for (const job of jobs) job.controller.abort(new Error("Server shutting down"));
-    await Promise.allSettled(jobs.map((job) => job.completion));
+    await scheduler.stop();
   });
 
   function runRequest(request: FastifyRequest) {
@@ -203,10 +186,14 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
     const identity = runRequest(request);
     if (!body.taskId && env.AGENT_DEMO_MODE === "1") return { accepted: true, runId: await scheduler.runNow(undefined, identity) };
     const taskId = z.string().min(1, "Select a configured content task").parse(body.taskId ?? "");
-    const admission = runtime.admitContentRun({ ...identity, taskId, trigger: "manual" });
-    if (admission.created) void startExecution(admission.runId).catch(() => undefined);
-    return { accepted: true, runId: admission.runId };
+    return { accepted: true, runId: await scheduler.runTask(taskId, identity) };
   });
+
+  app.post("/api/runs/:id/cancel", async (request: FastifyRequest<{ Params: { id: string } }>) => {
+    z.object({}).strict().parse(request.body ?? {});
+    return scheduler.cancel(request.params.id, auth.currentUser(request)?.id ?? "unknown");
+  });
+  app.get("/api/scheduler/jobs", async () => ({ jobs: scheduler.listJobs() }));
 
   app.get("/api/tasks", async () => ({ tasks: runtime.listContentTasks(), demoMode: env.AGENT_DEMO_MODE === "1", defaultModel: env.DEEPSEEK_MODEL }));
   app.put("/api/tasks/:id", async (request: FastifyRequest<{ Params: { id: string } }>) => {
@@ -235,7 +222,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       reply.status(400);
       return { error: { code: "INVALID_SCHEDULER_TICK", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
     }
-    const results = await scheduler.tick(parsed.data.now ? new Date(parsed.data.now) : new Date());
+    const results = await scheduler.tick(options.now?.() ?? new Date());
     return { results };
   });
 
@@ -382,7 +369,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       enabled: parsed.data.enabled,
       cron: parsed.data.cron,
       timezone: parsed.data.timezone,
-      nextRunAt: parsed.data.nextRunAt ?? new Date().toISOString(),
+      nextRunAt: nextRunAt(parsed.data, options.now?.() ?? new Date()),
       overlapPolicy: parsed.data.overlapPolicy,
       ...(parsed.data.taskId ? { taskId: parsed.data.taskId } : {}),
     };
@@ -403,7 +390,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       if ((parsed.data.enabled ?? current?.enabled) && !taskId) throw Object.assign(new Error("Bind a configured task before enabling this schedule"), { statusCode: 400 });
       if (taskId && !runtime.listContentTasks().some((task) => task.definition.id === taskId)) throw Object.assign(new Error("Content task not found"), { statusCode: 400 });
     }
-    return await runtime.updateSchedule(request.params.id, parsed.data);
+    return await runtime.updateSchedule(request.params.id, parsed.data, options.now?.() ?? new Date());
   });
 
   return { app, runtime, scheduler, database: runtime.database };

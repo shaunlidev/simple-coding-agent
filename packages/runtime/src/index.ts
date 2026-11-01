@@ -1,20 +1,21 @@
 import { and, asc, eq } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import cron from "node-cron";
-import type { ScheduledTask } from "node-cron";
 import { SafeNetwork, createRedactor } from "@simple-coding-agent/security";
 import { readBrowserSource } from "./browser-source.js";
 export { readBrowserSource } from "./browser-source.js";
 import { contentEntities, contentIdentityKey, runContentResults, contentDeliveries, runReceipts, runRequests, createSqliteDatabase, evalReports, feedback, memoryEntries, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
 import { parseRuntimeEvent, type RuntimeEvent, type RuntimeEventType } from "./events.js";
 import { contentTaskSchema, contentCitationSchema, sourceReadSchema, type ContentTaskRecord, type ContentCitation, type SourceRead } from "./content-contract.js";
+import { nextRunAt, validateScheduleClock, parseScheduleDate, coalesceDue } from "./schedule-time.js";
+export { nextRunAt } from "./schedule-time.js";
+export { RuntimeScheduler, type SchedulerRunResult, type RuntimeSchedulerOptions } from "./scheduler.js";
 export { contentTaskSchema } from "./content-contract.js";
 export type { ContentTask, ContentTaskRecord } from "./content-contract.js";
 export { executeContentRun, type ContentProviderFactory } from "./content-agent.js";
 export type { RuntimeEvent, RuntimeEventType } from "./events.js";
 
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "skipped";
 export type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped";
 export type Severity = "info" | "warning" | "error" | "critical";
 
@@ -64,6 +65,7 @@ export type RuntimeSpan = {
 };
 
 export type RuntimeSchedule = {
+  revision?: number;
   id: string;
   title: string;
   enabled: boolean;
@@ -71,6 +73,9 @@ export type RuntimeSchedule = {
   timezone: string;
   nextRunAt: string;
   lastRunAt?: string;
+  lastTrigger?: "manual" | "schedule" | "demo";
+  lastTriggerReason?: string;
+  lastScheduledFor?: string;
   overlapPolicy: "skip" | "queue" | "cancel_previous";
   taskId?: string;
 };
@@ -220,8 +225,6 @@ export type ToolApprovalRecord = {
   createdAt: string;
 };
 
-export type ScheduleTriggerReason = "manual" | "due" | "queued" | "overlap_skip" | "cancel_previous";
-
 export type DemoAgentRunOptions = {
   trigger?: RuntimeRun["trigger"];
   delayMs?: number;
@@ -230,6 +233,8 @@ export type DemoAgentRunOptions = {
   title?: string;
   schedulerDetail?: string;
   emitSchedulerEvent?: boolean;
+  alreadyStarted?: boolean;
+  signal?: AbortSignal;
 };
 
 function eventId(runId: string, type: RuntimeEventType): string {
@@ -394,6 +399,10 @@ export class SQLiteRuntimeStore {
   }
 
   async appendEvent(input: unknown): Promise<RuntimeEvent> {
+    return this.appendEventSync(input);
+  }
+
+  appendEventSync(input: unknown): RuntimeEvent {
     const event = parseRuntimeEvent(input);
     if (event.schemaVersion !== 1) throw new Error("Legacy event versions are read-only");
     return this.database.sqlite.transaction(() => this.writeEvent(event)).immediate();
@@ -407,9 +416,10 @@ export class SQLiteRuntimeStore {
       if (fingerprint(stored) !== fingerprint(event)) throw conflict("Event ID reused with different content");
       return stored;
     }
-    if (["run.queued", "run.started", "run.completed", "run.failed", "run.cancelled"].includes(event.type)) {
+    if (event.type === "run.started" || event.type === "run.completed" || /^(agent\.|pipeline\.|source\.|delivery\.)/.test(event.type)) this.assertRunExecutable(event.runId);
+    if (["run.queued", "run.started", "run.completed", "run.failed", "run.cancelled", "run.skipped", "run.cancel_requested"].includes(event.type)) {
       const lifecycle = this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.runId, event.runId)).all();
-      const terminal = lifecycle.some((row) => ["run.completed", "run.failed", "run.cancelled"].includes(row.type));
+      const terminal = lifecycle.some((row) => ["run.completed", "run.failed", "run.cancelled", "run.skipped"].includes(row.type));
       if (terminal || lifecycle.some((row) => row.type === event.type)) throw conflict("Invalid run lifecycle transition");
       if (event.type === "run.completed" && !lifecycle.some((row) => row.type === "run.started")) throw conflict("Cannot complete a run before it starts");
       if (event.type === "run.queued" && lifecycle.some((row) => row.type === "run.started")) throw conflict("Cannot queue an already started run");
@@ -424,7 +434,20 @@ export class SQLiteRuntimeStore {
       timestamp: event.timestamp,
       payloadJson: JSON.stringify(event.payload),
     }).run();
+    if (["run.completed", "run.failed", "run.cancelled", "run.skipped"].includes(event.type)) {
+      this.database.sqlite.prepare("update scheduled_jobs set state = ?, finished_at = ? where run_id = ?").run(event.type.slice(4), event.timestamp, event.runId);
+    } else if (event.type === "run.started") {
+      this.database.sqlite.prepare("update scheduled_jobs set state = 'running', started_at = ? where run_id = ?").run(event.timestamp, event.runId);
+      this.database.sqlite.prepare("update schedules set last_run_at = ? where id = (select schedule_id from scheduled_jobs where run_id = ?)").run(event.timestamp, event.runId);
+    } else if (event.type === "run.cancel_requested") {
+      this.database.sqlite.prepare("update scheduled_jobs set state = 'cancelling', reason = ? where run_id = ?").run(String(event.payload.reason), event.runId);
+    }
     return event;
+  }
+
+  assertRunExecutable(runId: string): void {
+    const value = this.database.sqlite.prepare("select state from scheduled_jobs where run_id = ?").get(runId);
+    if (value && !["queued", "running"].includes(z.object({ state: z.string() }).parse(value).state)) throw conflict("Run is cancelled, cancelling or terminal");
   }
 
   createEvent(runId: string, type: RuntimeEventType, payload: Record<string, unknown>, options: { source?: string; severity?: Severity } = {}): RuntimeEvent {
@@ -476,18 +499,28 @@ export class SQLiteRuntimeStore {
   }
 
   async readSchedules(): Promise<RuntimeSchedule[]> {
-    const rows = await this.database.db.select().from(schedules).orderBy(asc(schedules.id));
-    return rows.map((row) => ({
-      id: row.id,
-      title: row.title,
-      enabled: row.enabled,
-      cron: row.cron,
-      timezone: row.timezone,
-      nextRunAt: row.nextRunAt ?? new Date().toISOString(),
-      ...(row.lastRunAt ? { lastRunAt: row.lastRunAt } : {}),
-      overlapPolicy: row.overlapPolicy as RuntimeSchedule["overlapPolicy"],
-      ...(row.taskId ? { taskId: row.taskId } : {}),
-    }));
+    return this.readSchedulesSync();
+  }
+
+  readSchedulesSync(): RuntimeSchedule[] {
+    const rows = this.database.db.select().from(schedules).orderBy(asc(schedules.id)).all();
+    return rows.map((row) => {
+      const value = this.database.sqlite.prepare("select trigger, reason, scheduled_for from scheduled_jobs where schedule_id = ? and started_at is not null order by seq desc limit 1").get(row.id);
+      const last = value ? z.object({ trigger: z.enum(["manual", "schedule", "demo"]), reason: z.string(), scheduled_for: z.string().nullable() }).parse(value) : undefined;
+      return {
+        id: row.id,
+        revision: row.revision,
+        title: row.title,
+        enabled: row.enabled,
+        cron: row.cron,
+        timezone: row.timezone,
+        nextRunAt: row.nextRunAt ?? nextRunAt(row),
+        ...(row.lastRunAt ? { lastRunAt: row.lastRunAt } : {}),
+        overlapPolicy: z.enum(["skip", "queue", "cancel_previous"]).parse(row.overlapPolicy),
+        ...(row.taskId ? { taskId: row.taskId } : {}),
+        ...(last ? { lastTrigger: last.trigger, lastTriggerReason: last.reason, ...(last.scheduled_for ? { lastScheduledFor: last.scheduled_for } : {}) } : {}),
+      };
+    });
   }
 
   async seedSchedules(): Promise<void> {
@@ -505,74 +538,57 @@ export class SQLiteRuntimeStore {
   }
 
   async createSchedule(schedule: RuntimeSchedule): Promise<RuntimeSchedule> {
+    validateScheduleClock(schedule);
+    if (schedule.nextRunAt) parseScheduleDate(schedule.nextRunAt);
     this.redactor.identifier(schedule.id);
     this.redactor.identifier(schedule.cron);
     this.redactor.identifier(schedule.timezone);
-    const next = {
-      ...schedule,
-      title: this.redactor.text(schedule.title),
-      nextRunAt: schedule.nextRunAt || nextRunAt(schedule, new Date()),
-    };
-    await this.database.db.insert(schedules).values({
-      id: next.id,
-      title: next.title,
-      enabled: next.enabled,
-      cron: next.cron,
-      timezone: next.timezone,
-      nextRunAt: next.nextRunAt,
-      lastRunAt: next.lastRunAt,
-      overlapPolicy: next.overlapPolicy,
-      taskId: next.taskId,
-    });
-    await this.appendEvent(this.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", { scheduleId: next.id, action: "created", enabled: next.enabled, cron: next.cron, nextRunAt: next.nextRunAt }, { source: "scheduler" }));
-    return next;
+    return this.database.sqlite.transaction(() => {
+      const next = {
+        ...schedule,
+        title: this.redactor.text(schedule.title),
+        nextRunAt: schedule.nextRunAt || nextRunAt(schedule, new Date()),
+      };
+      this.database.db.insert(schedules).values({
+        id: next.id,
+        title: next.title,
+        enabled: next.enabled,
+        cron: next.cron,
+        timezone: next.timezone,
+        nextRunAt: next.nextRunAt,
+        lastRunAt: next.lastRunAt,
+        overlapPolicy: next.overlapPolicy,
+        taskId: next.taskId,
+      }).run();
+      this.writeEvent(this.createEvent(`schedule-${randomUUID()}`, "scheduler.task_due", { scheduleId: next.id, action: "created", enabled: next.enabled, cron: next.cron, nextRunAt: next.nextRunAt }, { source: "scheduler" }));
+      return next;
+    }).immediate();
   }
 
-  async updateSchedule(id: string, patch: Partial<Pick<RuntimeSchedule, "enabled" | "cron" | "timezone" | "overlapPolicy" | "nextRunAt" | "lastRunAt" | "taskId">>): Promise<RuntimeSchedule> {
+  async updateSchedule(id: string, patch: Partial<Pick<RuntimeSchedule, "enabled" | "cron" | "timezone" | "overlapPolicy" | "nextRunAt" | "taskId">>, now = new Date()): Promise<RuntimeSchedule> {
     this.redactor.identifier(id);
     for (const value of Object.values(patch)) if (typeof value === "string") this.redactor.identifier(value);
-    const current = (await this.readSchedules()).find((schedule) => schedule.id === id);
-    if (!current) throw new Error(`Schedule not found: ${id}`);
-    const next = { ...current, ...patch };
-    if (patch.cron || patch.timezone) next.nextRunAt = patch.nextRunAt ?? nextRunAt(next, new Date());
-    await this.database.db.update(schedules).set({
-      enabled: next.enabled,
-      cron: next.cron,
-      timezone: next.timezone,
-      nextRunAt: next.nextRunAt,
-      lastRunAt: next.lastRunAt,
-      overlapPolicy: next.overlapPolicy,
-      taskId: next.taskId,
-    }).where(eq(schedules.id, id));
-    await this.appendEvent(this.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", { scheduleId: id, action: "updated", enabled: next.enabled, cron: next.cron, nextRunAt: next.nextRunAt }, { source: "scheduler" }));
-    return next;
-  }
-
-  async dueSchedules(now: Date = new Date()): Promise<RuntimeSchedule[]> {
-    return (await this.readSchedules()).filter((schedule) => schedule.enabled && new Date(schedule.nextRunAt).getTime() <= now.getTime());
-  }
-
-  async markScheduleTriggered(id: string, runId: string, now: Date = new Date(), reason: ScheduleTriggerReason = "due"): Promise<RuntimeSchedule> {
-    const current = (await this.readSchedules()).find((schedule) => schedule.id === id);
-    if (!current) throw new Error(`Schedule not found: ${id}`);
-    const next: RuntimeSchedule = {
-      ...current,
-      lastRunAt: now.toISOString(),
-      nextRunAt: nextRunAt(current, now),
-    };
-    await this.database.db.update(schedules).set({
-      lastRunAt: next.lastRunAt,
-      nextRunAt: next.nextRunAt,
-    }).where(eq(schedules.id, id));
-    await this.appendEvent(this.createEvent(runId, "scheduler.task_due", {
-      taskId: id,
-      scheduleId: id,
-      trigger: "schedule",
-      reason,
-      nextRunAt: next.nextRunAt,
-      detail: `Schedule ${id} triggered by ${reason}`,
-    }, { source: "scheduler" }));
-    return next;
+    return this.database.sqlite.transaction(() => {
+      const current = this.readSchedulesSync().find((schedule) => schedule.id === id);
+      if (!current) throw new Error(`Schedule not found: ${id}`);
+      const next = { ...current, ...patch, revision: (current.revision ?? 1) + 1 };
+      validateScheduleClock(next);
+      if (patch.cron || patch.timezone) next.nextRunAt = patch.nextRunAt ?? nextRunAt(next, now);
+      else if (patch.enabled && !current.enabled && !patch.nextRunAt && parseScheduleDate(next.nextRunAt) <= now) next.nextRunAt = coalesceDue(next, now).next;
+      parseScheduleDate(next.nextRunAt);
+      this.database.db.update(schedules).set({
+        revision: next.revision,
+        enabled: next.enabled,
+        cron: next.cron,
+        timezone: next.timezone,
+        nextRunAt: next.nextRunAt,
+        lastRunAt: next.lastRunAt,
+        overlapPolicy: next.overlapPolicy,
+        taskId: next.taskId,
+      }).where(eq(schedules.id, id)).run();
+      this.writeEvent(this.createEvent(`schedule-${randomUUID()}`, "scheduler.task_due", { scheduleId: id, action: "updated", enabled: next.enabled, cron: next.cron, nextRunAt: next.nextRunAt }, { source: "scheduler" }));
+      return next;
+    }).immediate();
   }
 
   async writeMemoryEntry(input: MemoryEntryInput): Promise<{ id: string; createdAt: string }> {
@@ -829,11 +845,11 @@ export class SQLiteRuntimeStore {
     }).immediate();
   }
 
-  admitContentRun(input: { actor: string; key: string; taskId: string; trigger: "manual" | "schedule" }) {
+  admitContentRun(input: { actor: string; key: string; taskId: string; trigger: "manual" | "schedule"; requestTarget?: string }) {
     return this.database.sqlite.transaction(() => {
       const task = this.listContentTasks().find((candidate) => candidate.definition.id === input.taskId);
       if (!task) throw Object.assign(new Error("Configured content task not found"), { statusCode: 404 });
-      const admission = this.admitRun({ actor: input.actor, key: input.key, intent: { taskId: input.taskId, title: task.definition.title, trigger: input.trigger } });
+      const admission = this.admitRun({ actor: input.actor, key: input.key, intent: { taskId: input.taskId, title: task.definition.title, trigger: input.trigger, requestTarget: input.requestTarget } });
       if (admission.created) this.database.sqlite.prepare("insert into run_task_snapshots values (?, ?, ?)").run(admission.runId, task.revision, JSON.stringify(task.definition));
       return admission;
     }).immediate();
@@ -868,10 +884,10 @@ export class SQLiteRuntimeStore {
     }).immediate();
   }
 
-  admitRun(input: { actor: string; key: string; intent: { taskId: string; title: string; trigger: RuntimeRun["trigger"] } }) {
+  admitRun(input: { actor: string; key: string; intent: { taskId: string; title: string; trigger: RuntimeRun["trigger"]; requestTarget?: string } }) {
     const actor = this.redactor.identifier(z.string().min(1).max(128).parse(input.actor));
     const key = this.redactor.identifier(z.string().min(1).max(128).parse(input.key));
-    const intentHash = fingerprint({ version: 1, taskId: input.intent.taskId, trigger: input.intent.trigger });
+    const intentHash = fingerprint({ version: 1, taskId: input.intent.requestTarget ?? input.intent.taskId, trigger: input.intent.trigger });
     return this.database.sqlite.transaction(() => {
       const prior = this.database.db.select().from(runRequests).where(and(eq(runRequests.actor, actor), eq(runRequests.key, key))).get();
       if (prior) {
@@ -903,6 +919,7 @@ export class SQLiteRuntimeStore {
         return prior;
       }
       const events = this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.runId, runId)).orderBy(asc(runtimeEvents.sequence)).all();
+      this.assertRunExecutable(runId);
       const started = events.find((event) => event.type === "run.started");
       if (!started || events.some((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type))) throw conflict("Run is not accepting content results");
       const payload = z.record(z.string(), z.json()).parse(JSON.parse(started.payloadJson));
@@ -1043,8 +1060,8 @@ function projectRuns(events: RuntimeEvent[]): RuntimeRun[] {
 function projectRun(runId: string, events: RuntimeEvent[]): RuntimeRun {
   const started = events.find((event) => event.type === "run.started");
   const requested = started ?? events.find((event) => event.type === "run.queued");
-  const completed = [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.failed" || event.type === "run.cancelled");
-  const status: RunStatus = completed?.type === "run.completed" ? "completed" : completed?.type === "run.failed" ? "failed" : completed?.type === "run.cancelled" ? "cancelled" : started ? "running" : "queued";
+  const completed = [...events].reverse().find((event) => ["run.completed", "run.failed", "run.cancelled", "run.skipped"].includes(event.type));
+  const status: RunStatus = completed?.type === "run.completed" ? "completed" : completed?.type === "run.failed" ? "failed" : completed?.type === "run.cancelled" ? "cancelled" : completed?.type === "run.skipped" ? "skipped" : events.some((event) => event.type === "run.cancel_requested") ? "cancelling" : started ? "running" : "queued";
   const costUsd = events.reduce((sum, event) => sum + Number(event.payload.costUsd ?? 0), 0);
   const inputTokens = events.reduce((sum, event) => sum + Number(event.payload.inputTokens ?? 0), 0);
   const outputTokens = events.reduce((sum, event) => sum + Number(event.payload.outputTokens ?? 0), 0);
@@ -1339,193 +1356,6 @@ export async function runContentPipeline(store: SQLiteRuntimeStore, runId: strin
   return store.commitContentRun({ runId, items: delivered, maxItems: options.maxItems ?? 5 }).items;
 }
 
-function parseIntervalMs(value: string): number | undefined {
-  const match = value.trim().match(/^@?every\s+(\d+)\s*([smhd])$/i);
-  if (!match) return undefined;
-  const amount = Number(match[1]);
-  const unit = match[2]?.toLowerCase();
-  const multiplier = unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? 60 * 60_000 : 24 * 60 * 60_000;
-  return amount * multiplier;
-}
-
-function nextDailyAt(hour: number, minute: number, from: Date): string {
-  const next = new Date(from);
-  next.setSeconds(0, 0);
-  next.setHours(hour, minute, 0, 0);
-  if (next.getTime() <= from.getTime()) next.setDate(next.getDate() + 1);
-  return next.toISOString();
-}
-
-export function nextRunAt(schedule: Pick<RuntimeSchedule, "cron">, from: Date = new Date()): string {
-  const intervalMs = parseIntervalMs(schedule.cron);
-  if (intervalMs) return new Date(from.getTime() + intervalMs).toISOString();
-
-  const parts = schedule.cron.trim().split(/\s+/);
-  if (parts.length === 5) {
-    const [minute, hour] = parts;
-    if (/^\d+$/.test(minute ?? "") && /^\d+$/.test(hour ?? "")) {
-      return nextDailyAt(Number(hour), Number(minute), from);
-    }
-    const everyHour = hour?.match(/^\*\/(\d+)$/);
-    if (/^\d+$/.test(minute ?? "") && everyHour) {
-      const hours = Number(everyHour[1]);
-      return new Date(from.getTime() + hours * 60 * 60_000).toISOString();
-    }
-  }
-
-  return new Date(from.getTime() + 60_000).toISOString();
-}
-
-export type SchedulerRunResult =
-  | { status: "started"; scheduleId: string; runId: string; reason: "due" | "manual" | "cancel_previous" | "queued" }
-  | { status: "skipped"; scheduleId: string; reason: "paused" | "overlap_skip" }
-  | { status: "queued"; scheduleId: string; reason: "overlap_queue" };
-
-export type RuntimeSchedulerOptions = {
-  runtime: SQLiteRuntimeStore;
-  runAgent?: (options: {
-    runId: string;
-    schedule: RuntimeSchedule;
-    trigger: RuntimeRun["trigger"];
-    emitSchedulerEvent: boolean;
-  }) => Promise<string>;
-  now?: () => Date;
-};
-
-export class RuntimeScheduler {
-  private readonly activeRuns = new Map<string, Promise<string>>();
-  private readonly queuedSchedules = new Set<string>();
-  private cronTask: ScheduledTask | undefined;
-
-  constructor(private readonly options: RuntimeSchedulerOptions) {}
-
-  async tick(now: Date = this.now()): Promise<SchedulerRunResult[]> {
-    const due = await this.options.runtime.dueSchedules(now);
-    const results: SchedulerRunResult[] = [];
-    for (const schedule of due) {
-      results.push(await this.triggerSchedule(schedule, "due", now));
-    }
-    return results;
-  }
-
-  async runNow(scheduleId?: string, request: { actor: string; key: string } = { actor: "local", key: randomUUID() }): Promise<string> {
-    const schedule = scheduleId ? (await this.options.runtime.readSchedules()).find((candidate) => candidate.id === scheduleId) : undefined;
-    if (scheduleId && !schedule) throw new Error(`Schedule not found: ${scheduleId}`);
-    const intent = { taskId: schedule?.id ?? "manual-content", title: schedule?.title ?? "Content run", trigger: "manual" as const };
-    const admission = schedule?.taskId
-      ? this.options.runtime.admitContentRun({ ...request, taskId: schedule.taskId, trigger: "manual" })
-      : this.options.runtime.admitRun({ ...request, intent });
-    if (!admission.created) return admission.runId;
-    try {
-      if (!schedule) return await runDemoAgent(this.options.runtime, { runId: admission.runId, trigger: "manual", delayMs: 0 });
-      if (!schedule.enabled) throw new Error(`Schedule is paused: ${scheduleId}`);
-      const result = await this.triggerSchedule(schedule, "manual", this.now(), admission.runId);
-      if (result.status !== "started") throw new Error(`Schedule did not start: ${result.reason}`);
-      return result.runId;
-    } catch (error) {
-      const run = await this.options.runtime.projectRun(admission.runId);
-      if (run.status === "queued" || run.status === "running") await this.options.runtime.appendEvent(this.options.runtime.createEvent(admission.runId, "run.failed", { reason: "execution_failed", detail: error instanceof Error ? error.message : String(error) }, { severity: "error" }));
-      throw error;
-    }
-  }
-
-  start(): void {
-    if (this.cronTask) return;
-    this.cronTask = cron.schedule("* * * * *", () => {
-      this.tick().catch((error) => {
-        process.stderr.write(`scheduler tick failed: ${error instanceof Error ? error.message : String(error)}\n`);
-      });
-    });
-  }
-
-  stop(): void {
-    this.cronTask?.stop();
-    this.cronTask?.destroy();
-    this.cronTask = undefined;
-  }
-
-  private now(): Date {
-    return this.options.now?.() ?? new Date();
-  }
-
-  private async triggerSchedule(schedule: RuntimeSchedule, reason: "due" | "manual" | "queued", now: Date, admittedRunId?: string): Promise<SchedulerRunResult> {
-    if (!schedule.enabled) {
-      await this.options.runtime.appendEvent(this.options.runtime.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", {
-        scheduleId: schedule.id,
-        reason: "paused",
-        detail: `Schedule ${schedule.id} is paused`,
-      }, { source: "scheduler" }));
-      return { status: "skipped", scheduleId: schedule.id, reason: "paused" };
-    }
-
-    const active = this.activeRuns.get(schedule.id);
-    if (active) {
-      if (schedule.overlapPolicy === "skip") {
-        await this.options.runtime.appendEvent(this.options.runtime.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", {
-          scheduleId: schedule.id,
-          reason: "overlap_skip",
-          detail: `Schedule ${schedule.id} skipped because a prior run is still active`,
-        }, { source: "scheduler", severity: "warning" }));
-        return { status: "skipped", scheduleId: schedule.id, reason: "overlap_skip" };
-      }
-      if (schedule.overlapPolicy === "queue") {
-        this.queuedSchedules.add(schedule.id);
-        await this.options.runtime.appendEvent(this.options.runtime.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", {
-          scheduleId: schedule.id,
-          reason: "overlap_queue",
-          detail: `Schedule ${schedule.id} queued behind the active run`,
-        }, { source: "scheduler" }));
-        void active.catch(() => undefined).then(() => {
-          this.runQueuedSchedule(schedule.id).catch((error) => {
-            process.stderr.write(`queued schedule failed: ${error instanceof Error ? error.message : String(error)}\n`);
-          });
-        });
-        return { status: "queued", scheduleId: schedule.id, reason: "overlap_queue" };
-      }
-      await this.options.runtime.appendEvent(this.options.runtime.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", {
-        scheduleId: schedule.id,
-        reason: "cancel_previous",
-        detail: `Schedule ${schedule.id} started a replacement run by policy`,
-      }, { source: "scheduler", severity: "warning" }));
-    }
-
-    return this.startScheduleRun(schedule, schedule.overlapPolicy === "cancel_previous" && active ? "cancel_previous" : reason, now, admittedRunId);
-  }
-
-  private async startScheduleRun(schedule: RuntimeSchedule, reason: "due" | "manual" | "queued" | "cancel_previous", now: Date, admittedRunId?: string): Promise<SchedulerRunResult> {
-    const admission = !admittedRunId && schedule.taskId ? this.options.runtime.admitContentRun({ actor: "scheduler", key: `${schedule.id}:${now.toISOString()}`, taskId: schedule.taskId, trigger: "schedule" }) : undefined;
-    const runId = admittedRunId ?? admission?.runId ?? `run-${randomUUID()}`;
-    if (admission && !admission.created) return { status: "started", scheduleId: schedule.id, runId, reason };
-    await this.options.runtime.markScheduleTriggered(schedule.id, runId, now, reason);
-    const run = this.runAgent({ runId, schedule, trigger: reason === "manual" ? "manual" : "schedule", emitSchedulerEvent: false });
-    this.activeRuns.set(schedule.id, run);
-    const cleanup = () => {
-      if (this.activeRuns.get(schedule.id) === run) this.activeRuns.delete(schedule.id);
-    };
-    void run.then(cleanup, cleanup);
-    if (!this.options.runAgent) await run;
-    return { status: "started", scheduleId: schedule.id, runId, reason };
-  }
-
-  private async runQueuedSchedule(scheduleId: string): Promise<void> {
-    if (!this.queuedSchedules.delete(scheduleId)) return;
-    const schedule = (await this.options.runtime.readSchedules()).find((candidate) => candidate.id === scheduleId);
-    if (!schedule || !schedule.enabled) return;
-    await this.startScheduleRun(schedule, "queued", this.now());
-  }
-
-  private async runAgent(options: { runId: string; schedule: RuntimeSchedule; trigger: RuntimeRun["trigger"]; emitSchedulerEvent: boolean }): Promise<string> {
-    if (this.options.runAgent) return this.options.runAgent(options);
-    return runDemoAgent(this.options.runtime, {
-      runId: options.runId,
-      taskId: options.schedule.id,
-      title: options.schedule.title,
-      trigger: options.trigger,
-      emitSchedulerEvent: options.emitSchedulerEvent,
-      delayMs: 0,
-    });
-  }
-}
 
 function defaultSchedules(now: string): RuntimeSchedule[] {
   return [
@@ -1630,7 +1460,8 @@ export async function runDemoAgent(store: SQLiteRuntimeStore, options: DemoAgent
   if (options.emitSchedulerEvent !== false) {
     await emit("scheduler.task_due", { taskId, trigger, detail: options.schedulerDetail ?? "Manual trigger accepted by scheduler" }, { source: "scheduler" });
   }
-  await emit("run.started", { taskId, title, trigger, mode: "demo" }, { source: "orchestrator" });
-  await runContentPipeline(store, runId);
+  options.signal?.throwIfAborted();
+  if (!options.alreadyStarted) await emit("run.started", { taskId, title, trigger, mode: "demo" }, { source: "orchestrator" });
+  await runContentPipeline(store, runId, { signal: options.signal });
   return runId;
 }
