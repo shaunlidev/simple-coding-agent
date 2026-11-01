@@ -20,7 +20,11 @@ test("db migration is idempotent and creates runtime tables", () => {
   assert.equal(names.has("runtime_events"), true);
   assert.equal(names.has("runs"), true);
   assert.equal(names.has("schedules"), true);
-  assert.equal(names.has("content_items"), true);
+  assert.equal(names.has("content_entities"), true);
+  assert.equal(names.has("run_content_results"), true);
+  assert.equal(names.has("content_deliveries"), true);
+  assert.equal(names.has("run_receipts"), true);
+  assert.equal(names.has("content_items"), false);
   assert.equal(names.has("tool_approvals"), true);
   database.sqlite.close();
 });

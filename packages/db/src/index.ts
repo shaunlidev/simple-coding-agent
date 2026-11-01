@@ -1,8 +1,10 @@
 import Database from "better-sqlite3";
 import type BetterSqlite3 from "better-sqlite3";
+import { createHash } from "node:crypto";
+import { z } from "zod";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { integer, primaryKey, real, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 
 export const runs = sqliteTable("runs", {
   id: text("id").primaryKey(),
@@ -19,7 +21,9 @@ export const runs = sqliteTable("runs", {
 });
 
 export const runtimeEvents = sqliteTable("runtime_events", {
-  id: text("id").primaryKey(),
+  sequence: integer("sequence").primaryKey({ autoIncrement: true }),
+  id: text("id").notNull().unique(),
+  schemaVersion: integer("schema_version").notNull().default(1),
   runId: text("run_id").notNull(),
   type: text("type").notNull(),
   source: text("source").notNull(),
@@ -79,8 +83,14 @@ export const feedback = sqliteTable("feedback", {
   createdAt: text("created_at").notNull(),
 });
 
-export const contentItems = sqliteTable("content_items", {
+export const contentEntities = sqliteTable("content_entities", {
   id: text("id").primaryKey(),
+  identityKey: text("identity_key").notNull().unique(),
+  createdAt: text("created_at").notNull(),
+});
+
+export const runContentResults = sqliteTable("run_content_results", {
+  id: text("content_id").notNull().references(() => contentEntities.id),
   runId: text("run_id").notNull(),
   title: text("title").notNull(),
   source: text("source").notNull(),
@@ -91,7 +101,37 @@ export const contentItems = sqliteTable("content_items", {
   score: real("score").notNull(),
   status: text("status").notNull(),
   createdAt: text("created_at").notNull(),
+  position: integer("position").notNull(),
+}, (table) => [primaryKey({ columns: [table.runId, table.id] })]);
+
+export const contentDeliveries = sqliteTable("content_deliveries", {
+  id: text("id").primaryKey(),
+  runId: text("run_id").notNull(),
+  contentId: text("content_id").notNull().references(() => contentEntities.id),
+  scope: text("scope").notNull(),
+  channel: text("channel").notNull().default("inbox"),
+  provenance: text("provenance").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [unique().on(table.scope, table.channel, table.contentId)]);
+
+export const runReceipts = sqliteTable("run_receipts", {
+  runId: text("run_id").primaryKey(),
+  inputHash: text("input_hash").notNull(),
+  outcome: text("outcome").notNull(),
+  digest: text("digest").notNull(),
+  itemCount: integer("item_count").notNull(),
+  deliveredCount: integer("delivered_count").notNull(),
+  provenance: text("provenance").notNull(),
+  createdAt: text("created_at").notNull(),
 });
+
+export const runRequests = sqliteTable("run_requests", {
+  actor: text("actor").notNull(),
+  key: text("request_key").notNull(),
+  intentHash: text("intent_hash").notNull(),
+  runId: text("run_id").notNull().unique(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [primaryKey({ columns: [table.actor, table.key] })]);
 
 export const evalReports = sqliteTable("eval_reports", {
   id: text("id").primaryKey(),
@@ -125,7 +165,7 @@ export type SqliteDatabase = {
   db: BetterSQLite3Database;
 };
 
-const migrations = [
+const baseline = [
   `create table if not exists execution_approvals (id text primary key, run_id text not null, tool text not null, args_hash text not null, requested_by text not null, approved_by text, status text not null check (status in ('pending','approved','consumed','denied')), expires_at integer not null, consumed_at integer, created_at integer not null)`,
   `create table if not exists auth_sessions (id_hash text primary key, generation text not null, payload_json text not null, expires_at integer not null)`,
   `create index if not exists auth_sessions_expiry_idx on auth_sessions (expires_at)`,
@@ -145,12 +185,64 @@ const migrations = [
   `create virtual table if not exists memory_fts using fts5(id, kind, content, metadata_json)`,
 ];
 
-const optionalMigrations = [
-  `alter table content_items add column evidence_json text not null default '[]'`,
+const consistencySchema = [
+  `alter table runtime_events rename to runtime_events_legacy`,
+  `create table runtime_events (sequence integer primary key autoincrement, id text not null unique, schema_version integer not null default 1, run_id text not null, type text not null, source text not null, severity text not null, timestamp text not null, payload_json text not null)`,
+  `insert into runtime_events (id, schema_version, run_id, type, source, severity, timestamp, payload_json) select id, 0, run_id, type, source, severity, timestamp, payload_json from runtime_events_legacy order by rowid`,
+  `drop table runtime_events_legacy`,
+  `create index runtime_events_run_id_idx on runtime_events (run_id, sequence)`,
+  `create table content_entities (id text primary key, identity_key text not null unique, created_at text not null)`,
+  `create table run_content_results (run_id text not null, content_id text not null references content_entities(id), title text not null, source text not null, url text, summary text not null, reason text not null, evidence_json text not null, score real not null, status text not null check(status in ('delivered','already_delivered','filtered','failed')), created_at text not null, position integer not null, primary key(run_id, content_id))`,
+  `create table content_deliveries (id text primary key, run_id text not null, content_id text not null references content_entities(id), scope text not null, channel text not null default 'inbox', provenance text not null, created_at text not null, unique(scope, channel, content_id))`,
+  `create table run_receipts (run_id text primary key, input_hash text not null, outcome text not null check(outcome in ('delivered','no_new_items','legacy_incomplete')), digest text not null, item_count integer not null, delivered_count integer not null, provenance text not null, created_at text not null)`,
+  `create table run_requests (actor text not null, request_key text not null, intent_hash text not null, run_id text not null unique, created_at text not null, primary key(actor, request_key))`,
 ];
+
+export function contentIdentityKey(item: { url?: string | null; source: string; title: string }): string {
+  if (item.url) {
+    const url = new URL(item.url);
+    url.hash = "";
+    return `v1:url:${url.href}`;
+  }
+  return `v1:title:${JSON.stringify([item.source, item.title.replace(/\s+/g, " ").trim()])}`;
+}
+
+const legacyContent = z.object({
+  id: z.string(), run_id: z.string(), title: z.string(), source: z.string(), url: z.string().nullable(),
+  summary: z.string(), reason: z.string(), evidence_json: z.string(), score: z.number(),
+  status: z.enum(["delivered", "filtered", "failed"]), created_at: z.string(),
+});
+
+function importLegacyContent(database: SqliteDatabase) {
+  const { sqlite } = database;
+  const rows = sqlite.prepare("select * from content_items order by created_at, rowid").all().map((row) => legacyContent.parse(row));
+  for (const [position, row] of rows.entries()) {
+    const identityKey = contentIdentityKey(row);
+    sqlite.prepare("insert into content_entities values (?, ?, ?) on conflict(identity_key) do nothing").run(row.id, identityKey, row.created_at);
+    const identity = z.object({ id: z.string() }).parse(sqlite.prepare("select id from content_entities where identity_key = ?").get(identityKey));
+    sqlite.prepare("insert into run_content_results (run_id, content_id, title, source, url, summary, reason, evidence_json, score, status, created_at, position) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict do nothing")
+      .run(row.run_id, identity.id, row.title, row.source, row.url, row.summary, row.reason, row.evidence_json, row.score, row.status, row.created_at, position);
+    if (identity.id !== row.id) sqlite.prepare("update feedback set item_id = ? where item_id = ?").run(identity.id, row.id);
+    if (row.status === "delivered") {
+      const demo = sqlite.prepare("select 1 from runtime_events where run_id = ? and type = 'run.started' and json_extract(payload_json, '$.trigger') = 'demo'").get(row.run_id);
+      sqlite.prepare("insert into content_deliveries values (?, ?, ?, ?, 'inbox', 'legacy_import', ?) on conflict(scope, channel, content_id) do nothing")
+        .run(`legacy:${row.run_id}:${identity.id}`, row.run_id, identity.id, demo ? "demo" : "workspace", row.created_at);
+    }
+  }
+  // Old count/digest events lack item membership; never invent missing historical results.
+  sqlite.exec(`insert into run_receipts (run_id, input_hash, outcome, digest, item_count, delivered_count, provenance, created_at)
+    select e.run_id, 'legacy', 'legacy_incomplete', '',
+      (select count(*) from run_content_results r where r.run_id = e.run_id),
+      (select count(*) from content_deliveries d where d.run_id = e.run_id), 'legacy_import', min(e.timestamp)
+    from runtime_events e where e.type = 'run.started' group by e.run_id`);
+  // Retain original nonempty rows for forensic recovery when canonical identities merge.
+  sqlite.exec(rows.length > 0 ? "alter table content_items rename to legacy_content_items" : "drop table content_items");
+}
 
 export function createSqliteDatabase(path = ":memory:"): SqliteDatabase {
   const sqlite = new Database(path);
+  sqlite.pragma("foreign_keys = ON");
+  sqlite.pragma("busy_timeout = 5000");
   return {
     sqlite,
     db: drizzle(sqlite),
@@ -158,14 +250,31 @@ export function createSqliteDatabase(path = ":memory:"): SqliteDatabase {
 }
 
 export function migrateSqliteDatabase(database: SqliteDatabase): void {
-  for (const statement of migrations) {
-    database.sqlite.exec(statement);
-  }
-  for (const statement of optionalMigrations) {
-    try {
-      database.sqlite.exec(statement);
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
+  const { sqlite } = database;
+  const migrations = [
+    { version: 1, name: "baseline-f320f97", statements: baseline, apply: () => {
+      for (const statement of baseline) sqlite.exec(statement);
+      const columns = sqlite.prepare("pragma table_info(content_items)").all().map((row) => z.object({ name: z.string() }).parse(row).name);
+      if (!columns.includes("evidence_json")) sqlite.exec("alter table content_items add column evidence_json text not null default '[]'");
+    } },
+    { version: 2, name: "run-content-consistency-v1", statements: consistencySchema, apply: () => {
+      for (const statement of consistencySchema) sqlite.exec(statement);
+      importLegacyContent(database);
+    } },
+  ];
+  sqlite.transaction(() => {
+    sqlite.exec("create table if not exists schema_migrations (version integer primary key, name text not null, checksum text not null, applied_at text not null)");
+    const applied = sqlite.prepare("select version, checksum from schema_migrations order by version").all().map((row) => z.object({ version: z.number(), checksum: z.string() }).parse(row));
+    if (applied.some((row, index) => row.version !== index + 1 || row.version > migrations.length)) throw new Error("Unsupported database migration version");
+    for (const migration of migrations) {
+      const checksum = createHash("sha256").update(`${migration.name}\n${migration.statements.join(";\n")}`).digest("hex");
+      const existing = applied.find((row) => row.version === migration.version);
+      if (existing) {
+        if (existing.checksum !== checksum) throw new Error(`Migration checksum mismatch: ${migration.version}`);
+        continue;
+      }
+      migration.apply();
+      sqlite.prepare("insert into schema_migrations values (?, ?, ?, ?)").run(migration.version, migration.name, checksum, new Date().toISOString());
     }
-  }
+  }).immediate();
 }

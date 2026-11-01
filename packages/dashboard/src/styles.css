@@ -496,3 +496,6 @@ meter {
     flex-direction: column;
   }
 }
+.runHistory { display: grid; gap: 8px; min-width: 0; }
+.runHistory select { width: 100%; min-width: 0; padding: 8px; font: inherit; }
+.runIdentity { overflow-wrap: anywhere; font-family: monospace; }

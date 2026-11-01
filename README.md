@@ -209,6 +209,10 @@ Memory clearing now requires a server-recorded approval. Request `/api/security/
 
 R2 security gates now cover authenticated API/SSE/export, bound single-use approvals, validated and pinned outbound HTTP, browser subrequest restrictions, and redaction before new persistence/log writes. See [R2 evidence](docs/evidence/R2-security-boundaries.md) for results and residual risks. This does not scrub historical databases or provide a multi-tenant execution sandbox. R3-R10 and cloud release acceptance remain open; do not expose this branch as a production service.
 
+Run now currently uses a labeled demo executor; real Dashboard provider/source execution is the next R4 gate. Runtime history now keeps each run's result and returns `no_new_items` when there is nothing new to deliver. The Runs selector can inspect older results. Manual-run API clients should retain one `Idempotency-Key` per intended action across transport retries; reusing it for another target returns 409. A new intentional run uses a new key. The UI retains the key after a request error.
+
+Database migrations are versioned and transactional. Back up an existing SQLite database before upgrading. Surviving legacy rows are imported, but old outputs already discarded by the previous schema cannot be reconstructed; those receipts are marked `legacy_incomplete`. Reads and readiness checks no longer create demo runs. `db:seed` explicitly creates demo data; skip that command for an empty workspace.
+
 Initialize the local database:
 
 ```bash

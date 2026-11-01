@@ -7,7 +7,7 @@ const env = parseEnvironment(process.env);
 if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
 
 const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH });
-await runtime.ensureSeeded();
+await runtime.seedDemo();
 runtime.database.sqlite.close();
 
 console.log(`Seeded Agent Ops runtime at ${env.AGENT_DB_PATH}`);

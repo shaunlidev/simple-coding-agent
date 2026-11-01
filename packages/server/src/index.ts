@@ -2,6 +2,7 @@ import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { existsSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RuntimeScheduler, SQLiteRuntimeStore, type RuntimeSchedule } from "@simple-coding-agent/runtime";
@@ -132,7 +133,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   app.get("/healthz", async () => ({ ok: true }));
 
   app.get("/readyz", async () => {
-    await runtime.ensureSeeded();
+    runtime.database.sqlite.prepare("select 1").get();
     return { ok: true, database: "connected" };
   });
 
@@ -141,12 +142,12 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   app.get("/api/runs", async () => ({ runs: await runtime.listRuns() }));
 
   app.get("/api/runs/:id", async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
-    const events = await runtime.listEvents(request.params.id);
-    if (events.length === 0) {
+    const detail = runtime.readRunDetail(request.params.id);
+    if (!detail) {
       reply.status(404);
       return { error: { code: "RUN_NOT_FOUND", message: "Run not found" } };
     }
-    return redactForResponse({ run: await runtime.projectRun(request.params.id), events });
+    return redactForResponse(detail);
   });
 
   app.get("/api/events", async (request) => {
@@ -166,13 +167,21 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   if (options.startScheduler) scheduler.start();
   app.addHook("onClose", async () => scheduler.stop());
 
-  app.post("/api/runs/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async () => {
-    const runId = await scheduler.runNow();
+  function runRequest(request: FastifyRequest) {
+    z.object({}).strict().parse(request.body ?? {});
+    const actor = auth.currentUser(request);
+    if (!actor) throw Object.assign(new Error("Sign in required"), { statusCode: 401 });
+    const key = z.string().min(1).max(128).parse(request.headers["idempotency-key"] ?? randomUUID());
+    return { actor: actor.id, key };
+  }
+
+  app.post("/api/runs/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request) => {
+    const runId = await scheduler.runNow(undefined, runRequest(request));
     return { accepted: true, runId };
   });
 
   app.post("/api/schedules/:id/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request: FastifyRequest<{ Params: { id: string } }>) => {
-    const runId = await scheduler.runNow(request.params.id);
+    const runId = await scheduler.runNow(request.params.id, runRequest(request));
     return { accepted: true, runId };
   });
 

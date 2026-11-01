@@ -101,7 +101,7 @@ export type DeliveredContentItem = {
   summary: string;
   reason: string;
   score: number;
-  status: "delivered" | "filtered" | "failed";
+  status: "delivered" | "already_delivered" | "filtered" | "failed";
   evidence: string[];
   createdAt: string;
 };
@@ -141,6 +141,7 @@ export type RuntimeSnapshot = {
     delivered: number;
     failedSources: string[];
     digest?: string;
+    outcome?: "delivered" | "no_new_items" | "legacy_incomplete";
   };
   events: RuntimeEvent[];
 };
@@ -197,9 +198,18 @@ export async function fetchSnapshot(): Promise<RuntimeSnapshot> {
   return requestJson<RuntimeSnapshot>("/api/snapshot");
 }
 
-export async function runNow(): Promise<{ accepted: true; runId: string }> {
-  return requestJson<{ accepted: true; runId: string }>("/api/runs/run-now", { method: "POST", body: "{}" });
+export async function runNow(key: string): Promise<{ accepted: true; runId: string }> {
+  return requestJson<{ accepted: true; runId: string }>("/api/runs/run-now", { method: "POST", headers: { "idempotency-key": key }, body: "{}" });
 }
+
+export type RunDetail = {
+  run: RuntimeRun;
+  events: RuntimeEvent[];
+  result: { outcome: "delivered" | "no_new_items" | "legacy_incomplete"; digest: string; items: DeliveredContentItem[]; deliveredCount: number } | null;
+};
+
+export const fetchRuns = () => requestJson<{ runs: RuntimeRun[] }>("/api/runs");
+export const fetchRun = (id: string) => requestJson<RunDetail>(`/api/runs/${encodeURIComponent(id)}`);
 
 export async function patchSchedule(id: string, patch: Partial<Pick<RuntimeSchedule, "enabled" | "cron" | "timezone" | "overlapPolicy">>): Promise<RuntimeSchedule> {
   return requestJson<RuntimeSchedule>(`/api/schedules/${encodeURIComponent(id)}`, {

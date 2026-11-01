@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type React from "react";
-import { useEffect, useMemo } from "react";
-import { fetchSnapshot, patchSchedule, runNow, type DeliveredContentItem, type EvalGate, type RuntimeEvent, type RuntimeSchedule, type RuntimeSnapshot, type RuntimeSpan, type RuntimeStep } from "./api.js";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { fetchRun, fetchRuns, fetchSnapshot, patchSchedule, runNow, type DeliveredContentItem, type EvalGate, type RuntimeEvent, type RuntimeSchedule, type RuntimeSnapshot, type RuntimeSpan, type RuntimeStep } from "./api.js";
 
 const snapshotKey = ["runtime-snapshot"] as const;
 
@@ -164,6 +164,8 @@ function ContentPipeline(props: { snapshot: RuntimeSnapshot }) {
       <div className="contentList">
         {props.snapshot.contentItems.map((item) => <ContentItem item={item} key={item.id} />)}
       </div>
+      {pipeline.outcome === "no_new_items" ? <p role="status">No new items. Nothing new was added to the inbox.</p> : null}
+      {pipeline.outcome === "legacy_incomplete" ? <p role="status">Legacy results may be incomplete.</p> : null}
       {props.snapshot.contentItems.length === 0 ? <EmptyState title="No delivered items" detail="Run the content pipeline to populate delivery output." /> : null}
     </div>
   );
@@ -324,13 +326,39 @@ function EmptyState(props: { title: string; detail: string }) {
   );
 }
 
+function RunHistory() {
+  const runs = useQuery({ queryKey: ["runtime-runs"], queryFn: fetchRuns, refetchInterval: 10_000 });
+  const [selected, setSelected] = useState("");
+  const id = selected || runs.data?.runs[0]?.id || "";
+  const detail = useQuery({ queryKey: ["runtime-run", id], queryFn: () => fetchRun(id), enabled: Boolean(id), refetchInterval: 10_000 });
+  if (runs.isError) return <p role="alert">Run history unavailable.</p>;
+  return <div className="runHistory">
+    <label htmlFor="run-history">Run history</label>
+    <select id="run-history" value={id} onChange={(event) => setSelected(event.target.value)}>
+      {!runs.data?.runs.length ? <option value="">No runs</option> : null}
+      {runs.data?.runs.map((run) => <option key={run.id} value={run.id}>{formatTime(run.startedAt)} · {run.status} · {run.id.slice(-8)}</option>)}
+    </select>
+    {detail.isError ? <p role="alert">Run details unavailable.</p> : null}
+    {detail.data ? <div aria-label="Historical run result">
+      <p className="runIdentity">{detail.data.run.id}</p>
+      <p>{detail.data.run.status} · {detail.data.result?.deliveredCount ?? 0} delivered</p>
+      {detail.data.result?.outcome === "no_new_items" ? <p role="status">No new items</p> : null}
+      {detail.data.result?.outcome === "legacy_incomplete" ? <p role="status">Legacy results may be incomplete.</p> : null}
+      {detail.data.result?.items.map((item) => <ContentItem key={item.id} item={item} />)}
+    </div> : null}
+  </div>;
+}
+
 export function App({ canOperate }: { canOperate: boolean }) {
   const queryClient = useQueryClient();
+  const pendingRunKey = useRef<string | undefined>(undefined);
   const snapshot = useQuery<RuntimeSnapshot, Error>({ queryKey: snapshotKey, queryFn: fetchSnapshot, refetchInterval: 10_000 });
   const runNowMutation = useMutation({
-    mutationFn: runNow,
+    mutationFn: () => runNow(pendingRunKey.current ??= crypto.randomUUID()),
     onSuccess: async () => {
+      pendingRunKey.current = undefined;
       await queryClient.invalidateQueries({ queryKey: snapshotKey });
+      await queryClient.invalidateQueries({ queryKey: ["runtime-runs"] });
     },
   });
   const scheduleMutation = useMutation({
@@ -342,14 +370,21 @@ export function App({ canOperate }: { canOperate: boolean }) {
 
   useEffect(() => {
     const stream = new EventSource("/api/events/stream");
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
     const refresh = () => {
-      void queryClient.invalidateQueries({ queryKey: snapshotKey });
+      if (refreshTimer) return;
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined;
+        void queryClient.invalidateQueries({ queryKey: snapshotKey });
+        void queryClient.invalidateQueries({ queryKey: ["runtime-runs"] });
+        void queryClient.invalidateQueries({ queryKey: ["runtime-run"] });
+      }, 100);
     };
     stream.addEventListener("snapshot", refresh);
     stream.addEventListener("runtime-event", refresh);
     stream.addEventListener("runtime-error", refresh);
     stream.onerror = refresh;
-    return () => stream.close();
+    return () => { clearTimeout(refreshTimer); stream.close(); };
   }, [queryClient]);
 
   const data: RuntimeSnapshot | undefined = snapshot.data;
@@ -386,6 +421,9 @@ export function App({ canOperate }: { canOperate: boolean }) {
       <Metrics snapshot={data} />
 
       <div className="layoutGrid">
+        <Card title="Runs">
+          <RunHistory />
+        </Card>
         <Card title="Run Trace" eyebrow={data.latestRun?.id ?? "No run selected"}>
           {data.steps.length > 0 ? <Steps steps={data.steps} /> : <EmptyState title="No steps yet" detail="Run the agent to populate the trace." />}
         </Card>

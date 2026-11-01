@@ -10,7 +10,8 @@ test("sqlite runtime projects a complete agent ops snapshot from append-only eve
   const events = await store.listEvents(runId);
   const snapshot = await store.snapshot();
 
-  assert.equal(events.length >= 12, true);
+  assert.equal(events.filter((event) => event.type === "run.completed").length, 1);
+  assert.equal(store.readRunResult(runId)?.deliveries.length, snapshot.pipeline.delivered);
   assert.equal(snapshot.latestRun?.id, runId);
   assert.equal(snapshot.latestRun?.status, "completed");
   assert.equal(snapshot.spans.some((span) => span.type === "llm"), true);
@@ -197,7 +198,7 @@ test("content pipeline dedupes, merges similar items, persists evidence, and tol
     ],
     network: new SafeNetwork({ allowlist: ["https://example.test"], resolve: async () => [{ address: "93.184.216.34", family: 4 }], transport: async ({ url }) => ({ url: url.href, status: 503, headers: {}, body: new Uint8Array() }) }),
   });
-  await store.appendEvent(store.createEvent(runId, "run.completed", { durationMs: 1 }, { source: "orchestrator" }));
+  assert.equal((await store.projectRun(runId)).status, "completed");
   const snapshot = await store.snapshot();
 
   assert.equal(delivered.length, 1);

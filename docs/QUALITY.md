@@ -25,7 +25,7 @@ The existing dashboard and deployment checks inspect build output and file text.
 | Deployment target | Linux arm64 container passed; selected cloud platform and architecture remain unverified | R10 |
 | Dependency advisories | Three moderate affected packages in unused glob/minimatch static enumeration path; no high/critical in official production audit | R2 triage; re-audit R10 |
 | Historical secrets | New writes/outputs are redacted; existing databases are not retroactively scrubbed | R3 migration / R10 release |
-| Content/run consistency | Repeated runs can have a nonempty digest with no latest-run result rows | R3 |
+| Legacy history completeness | R3 retains surviving rows and explicitly marks old receipts incomplete; previously discarded results cannot be recovered from count-only events | R3 evidence; R10 backup/release |
 | Real dashboard agent | Default execution uses mock sources and extractive summaries | R4 |
 | Schedule semantics | Host timezone affects execution; cancellation does not stop the old task | R5 |
 | Memory and practices | FTS storage exists, but use in model context and practice activation need verification | R6 |
@@ -34,6 +34,8 @@ The existing dashboard and deployment checks inspect build output and file text.
 | Release evidence | Browser, cloud, restart, backup, restore, and rollback gates remain unverified | R9, R10 |
 
 Record new regression coverage against behavior. A missing or skipped measurement remains unverified.
+
+R3's normalized results, unique inbox ledger, request idempotency and transactional terminal events pass repeat/concurrent/restart/rollback checks. Actual process-restart and desktop/mobile history verification passed. Default Run now still executes labeled demo sources; this is not R4 real-provider acceptance. Legacy bytes in existing databases/backups are not retroactively scrubbed, although API output is redacted. Old orphaned run recovery remains in R5's worker-ownership scope; a same-key retry does not silently execute it again.
 
 The default suite still reports two keyless DeepSeek tests as passed because those tests return early. They are NOT live model evidence; explicit skip reporting is required in R9. Existing bundle-word and deployment-file checks remain only static evidence, alongside the new actual R1/R2 browser/container gates.
 

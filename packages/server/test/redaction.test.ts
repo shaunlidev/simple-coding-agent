@@ -11,8 +11,8 @@ test("R2.5 configured secrets and secret fields never enter persisted events, me
     await request({ method: "POST", url: "/api/memory/entries", payload: { kind: "knowledge", content: `Useful knowledge ${secret}`, metadata: { authorization: fieldSecret } } });
     await runtime.recordSecurityAudit({ action: "redaction_probe", severity: "warning", message: secret });
     await runtime.saveEvalReport({ id: "redaction-eval", name: secret, status: "failed", score: 0, evidence: secret, evidenceData: { credential: fieldSecret } });
-    await runtime.insertContentItems([{ id: "redaction-content", runId: "redaction-run", title: secret, source: "fixture", summary: secret, reason: secret, evidence: [secret], score: 1, status: "delivered", createdAt: new Date().toISOString() }]);
-    for (const table of ["runtime_events", "memory_entries", "memory_fts", "security_audit", "eval_reports", "content_items"]) {
+    runtime.commitContentRun({ runId: "redaction-run", maxItems: 5, items: [{ id: "redaction-content", runId: "redaction-run", title: secret, source: "fixture", summary: secret, reason: secret, evidence: [secret], score: 1, status: "delivered", createdAt: new Date().toISOString() }] });
+    for (const table of ["runtime_events", "memory_entries", "memory_fts", "security_audit", "eval_reports", "content_entities", "run_content_results", "content_deliveries", "run_receipts"]) {
       const data = JSON.stringify(database.sqlite.prepare(`select * from ${table}`).all());
       assert.equal(data.includes(secret), false, `${table} contains a configured secret`);
       assert.equal(data.includes(fieldSecret), false, `${table} contains a structured secret field`);

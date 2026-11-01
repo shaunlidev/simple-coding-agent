@@ -1,41 +1,18 @@
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
+import { createHash, randomUUID } from "node:crypto";
+import { z } from "zod";
 import cron from "node-cron";
 import type { ScheduledTask } from "node-cron";
 import { SafeNetwork, createRedactor } from "@simple-coding-agent/security";
 import { readBrowserSource } from "./browser-source.js";
 export { readBrowserSource } from "./browser-source.js";
-import { contentItems, createSqliteDatabase, evalReports, feedback, memoryEntries, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
+import { contentEntities, contentIdentityKey, runContentResults, contentDeliveries, runReceipts, runRequests, createSqliteDatabase, evalReports, feedback, memoryEntries, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
+import { parseRuntimeEvent, type RuntimeEvent, type RuntimeEventType } from "./events.js";
+export type { RuntimeEvent, RuntimeEventType } from "./events.js";
 
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped";
 export type Severity = "info" | "warning" | "error" | "critical";
-
-export type RuntimeEventType =
-  | "scheduler.task_due"
-  | "run.started"
-  | "pipeline.fetch.started"
-  | "pipeline.fetch.completed"
-  | "pipeline.clean.completed"
-  | "pipeline.dedupe.completed"
-  | "pipeline.rank.completed"
-  | "pipeline.summarize.completed"
-  | "delivery.created"
-  | "memory.preference.updated"
-  | "eval.completed"
-  | "security.policy.checked"
-  | "security.policy.denied"
-  | "run.completed"
-  | "run.failed";
-
-export type RuntimeEvent = {
-  id: string;
-  runId: string;
-  type: RuntimeEventType;
-  source: string;
-  severity: Severity;
-  timestamp: string;
-  payload: Record<string, unknown>;
-};
 
 export type RuntimeRun = {
   id: string;
@@ -157,6 +134,7 @@ export type RuntimeSnapshot = {
     delivered: number;
     failedSources: string[];
     digest?: string;
+    outcome?: "delivered" | "no_new_items" | "legacy_incomplete";
   };
   events: RuntimeEvent[];
 };
@@ -189,7 +167,7 @@ export type DeliveredContentItem = {
   summary: string;
   reason: string;
   score: number;
-  status: "delivered" | "filtered" | "failed";
+  status: "delivered" | "already_delivered" | "filtered" | "failed";
   evidence: string[];
   createdAt: string;
 };
@@ -216,11 +194,6 @@ export type MemoryEntryInput = {
 export type MemoryExport = {
   memory: MemoryState;
   entries: Array<{ id: string; kind: string; sourceTrust: string; content: string; metadata: Record<string, unknown>; createdAt: string }>;
-};
-
-export type RuntimeEventStore = {
-  appendEvent(event: RuntimeEvent): Promise<RuntimeEvent>;
-  createEvent(runId: string, type: RuntimeEventType, payload: Record<string, unknown>, options?: { source?: string; severity?: Severity }): RuntimeEvent;
 };
 
 export type SecurityAuditRecord = {
@@ -254,17 +227,29 @@ export type DemoAgentRunOptions = {
 };
 
 function eventId(runId: string, type: RuntimeEventType): string {
-  return `${runId}-${type}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  return `${runId}-${type}-${randomUUID()}`;
 }
 
-function validateEvent(event: RuntimeEvent): void {
-  if (!event.id || !event.runId || !event.type || !event.source || !event.timestamp) {
-    throw new Error("Invalid runtime event: id, runId, type, source, and timestamp are required");
-  }
-  if (!["info", "warning", "error", "critical"].includes(event.severity)) {
-    throw new Error(`Invalid runtime event severity: ${event.severity}`);
-  }
+function canonicalJson(value: z.infer<ReturnType<typeof z.json>>): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key] ?? null)}`).join(",")}}`;
+  return JSON.stringify(value);
 }
+
+function fingerprint(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(z.json().parse(value))).digest("hex");
+}
+
+function conflict(message: string) {
+  return Object.assign(new Error(message), { statusCode: 409 });
+}
+
+const contentResultSchema = z.object({
+  id: z.string().min(1), runId: z.string().min(1), title: z.string(), source: z.string(), url: z.string().optional(),
+  summary: z.string(), reason: z.string(), score: z.number(), status: z.enum(["delivered", "already_delivered", "filtered", "failed"]),
+  evidence: z.array(z.string()), createdAt: z.iso.datetime({ offset: true }),
+});
+const outcomeSchema = z.enum(["delivered", "no_new_items", "legacy_incomplete"]);
 
 function stepFromEvent(event: RuntimeEvent): RuntimeStep | undefined {
   const nameByType: Partial<Record<RuntimeEventType, string>> = {
@@ -276,13 +261,14 @@ function stepFromEvent(event: RuntimeEvent): RuntimeStep | undefined {
     "pipeline.rank.completed": "Rank",
     "pipeline.summarize.completed": "Summarize",
     "delivery.created": "Deliver",
+    "delivery.skipped": "Deliver",
     "memory.preference.updated": "Learn",
     "eval.completed": "Eval Gate",
     "security.policy.checked": "Security Gate",
   };
   const name = nameByType[event.type];
   if (!name) return undefined;
-  const completed = event.type.endsWith(".completed") || event.type === "scheduler.task_due" || event.type === "delivery.created" || event.type === "memory.preference.updated" || event.type === "eval.completed" || event.type === "security.policy.checked";
+  const completed = event.type.endsWith(".completed") || event.type === "scheduler.task_due" || event.type.startsWith("delivery.") || event.type === "memory.preference.updated" || event.type === "eval.completed" || event.type === "security.policy.checked";
   return {
     id: `${event.runId}-${name.toLowerCase().replace(/\s+/g, "-")}`,
     name,
@@ -397,26 +383,46 @@ export class SQLiteRuntimeStore {
     this.redactor = createRedactor(options.secrets);
     this.network = options.network ?? new SafeNetwork({ allowlist: [] });
     this.database = options.database ?? createSqliteDatabase(options.path ?? ":memory:");
-    migrateSqliteDatabase(this.database);
+    try { migrateSqliteDatabase(this.database); }
+    catch (error) { if (!options.database) this.database.sqlite.close(); throw error; }
   }
 
-  async appendEvent(event: RuntimeEvent): Promise<RuntimeEvent> {
-    validateEvent(event);
-    event = { ...event, id: this.redactor.identifier(event.id), runId: this.redactor.identifier(event.runId), source: this.redactor.text(event.source), payload: this.redactor.record(event.payload) };
-    await this.database.db.insert(runtimeEvents).values({
+  async appendEvent(input: unknown): Promise<RuntimeEvent> {
+    const event = parseRuntimeEvent(input);
+    if (event.schemaVersion !== 1) throw new Error("Legacy event versions are read-only");
+    return this.database.sqlite.transaction(() => this.writeEvent(event)).immediate();
+  }
+
+  private writeEvent(event: RuntimeEvent): RuntimeEvent {
+    event = parseRuntimeEvent({ ...event, id: this.redactor.identifier(event.id), runId: this.redactor.identifier(event.runId), source: this.redactor.text(event.source), payload: this.redactor.record(event.payload) });
+    const existing = this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.id, event.id)).get();
+    if (existing) {
+      const stored = parseRuntimeEvent({ id: existing.id, runId: existing.runId, type: existing.type, source: existing.source, severity: existing.severity, timestamp: existing.timestamp, schemaVersion: existing.schemaVersion, payload: JSON.parse(existing.payloadJson) });
+      if (fingerprint(stored) !== fingerprint(event)) throw conflict("Event ID reused with different content");
+      return stored;
+    }
+    if (["run.queued", "run.started", "run.completed", "run.failed", "run.cancelled"].includes(event.type)) {
+      const lifecycle = this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.runId, event.runId)).all();
+      const terminal = lifecycle.some((row) => ["run.completed", "run.failed", "run.cancelled"].includes(row.type));
+      if (terminal || lifecycle.some((row) => row.type === event.type)) throw conflict("Invalid run lifecycle transition");
+      if (event.type === "run.completed" && !lifecycle.some((row) => row.type === "run.started")) throw conflict("Cannot complete a run before it starts");
+      if (event.type === "run.queued" && lifecycle.some((row) => row.type === "run.started")) throw conflict("Cannot queue an already started run");
+    }
+    this.database.db.insert(runtimeEvents).values({
       id: event.id,
+      schemaVersion: event.schemaVersion,
       runId: event.runId,
       type: event.type,
       source: event.source,
       severity: event.severity,
       timestamp: event.timestamp,
       payloadJson: JSON.stringify(event.payload),
-    });
+    }).run();
     return event;
   }
 
   createEvent(runId: string, type: RuntimeEventType, payload: Record<string, unknown>, options: { source?: string; severity?: Severity } = {}): RuntimeEvent {
-    return {
+    return parseRuntimeEvent({
       id: eventId(runId, type),
       runId,
       type,
@@ -424,21 +430,26 @@ export class SQLiteRuntimeStore {
       severity: options.severity ?? "info",
       timestamp: new Date().toISOString(),
       payload,
-    };
+    });
   }
 
   async listEvents(runId?: string): Promise<RuntimeEvent[]> {
+    return this.readEvents(runId);
+  }
+
+  private readEvents(runId?: string): RuntimeEvent[] {
     const rows = runId
-      ? await this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.runId, runId)).orderBy(asc(runtimeEvents.timestamp))
-      : await this.database.db.select().from(runtimeEvents).orderBy(asc(runtimeEvents.timestamp));
-    return rows.map((row) => ({
+      ? this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.runId, runId)).orderBy(asc(runtimeEvents.sequence)).all()
+      : this.database.db.select().from(runtimeEvents).orderBy(asc(runtimeEvents.sequence)).all();
+    return rows.map((row) => parseRuntimeEvent({
       id: row.id,
       runId: row.runId,
-      type: row.type as RuntimeEventType,
+      type: row.type,
       source: row.source,
-      severity: row.severity as Severity,
+      severity: row.severity,
       timestamp: row.timestamp,
-      payload: JSON.parse(row.payloadJson) as Record<string, unknown>,
+      schemaVersion: row.schemaVersion,
+      payload: JSON.parse(row.payloadJson),
     }));
   }
 
@@ -446,12 +457,16 @@ export class SQLiteRuntimeStore {
     return projectRun(runId, await this.listEvents(runId));
   }
 
+  readRunDetail(runId: string) {
+    return this.database.sqlite.transaction(() => {
+      const events = this.readEvents(runId);
+      if (events.length === 0) return undefined;
+      return { run: projectRun(runId, events), result: this.readRunResult(runId) ?? null, events };
+    })();
+  }
+
   async listRuns(): Promise<RuntimeRun[]> {
-    const events = await this.listEvents();
-    const runIds = [...new Set(events.map((event) => event.runId))].filter((runId) => events.some((event) => event.runId === runId && event.type === "run.started"));
-    return runIds
-      .map((runId) => projectRun(runId, events.filter((event) => event.runId === runId)))
-      .sort((left, right) => String(right.startedAt ?? "").localeCompare(String(left.startedAt ?? "")));
+    return projectRuns(this.readEvents());
   }
 
   async readSchedules(): Promise<RuntimeSchedule[]> {
@@ -784,29 +799,89 @@ export class SQLiteRuntimeStore {
     }));
   }
 
-  async insertContentItems(items: DeliveredContentItem[]): Promise<void> {
-    if (items.length === 0) return;
-    items = items.map((item) => ({ ...item, id: this.redactor.identifier(item.id), runId: this.redactor.identifier(item.runId), title: this.redactor.text(item.title), source: this.redactor.text(item.source), ...(item.url ? { url: this.redactor.text(item.url) } : {}), summary: this.redactor.text(item.summary), reason: this.redactor.text(item.reason), evidence: item.evidence.map(this.redactor.text) }));
-    await this.database.db.insert(contentItems).values(items.map((item) => ({
-      id: item.id,
-      runId: item.runId,
-      title: item.title,
-      source: item.source,
-      url: item.url,
-      summary: item.summary,
-      reason: item.reason,
-      evidenceJson: JSON.stringify(item.evidence),
-      score: item.score,
-      status: item.status,
-      createdAt: item.createdAt,
-    }))).onConflictDoNothing();
+  admitRun(input: { actor: string; key: string; intent: { taskId: string; title: string; trigger: RuntimeRun["trigger"] } }) {
+    const actor = this.redactor.identifier(z.string().min(1).max(128).parse(input.actor));
+    const key = this.redactor.identifier(z.string().min(1).max(128).parse(input.key));
+    const intentHash = fingerprint({ version: 1, taskId: input.intent.taskId, trigger: input.intent.trigger });
+    return this.database.sqlite.transaction(() => {
+      const prior = this.database.db.select().from(runRequests).where(and(eq(runRequests.actor, actor), eq(runRequests.key, key))).get();
+      if (prior) {
+        if (prior.intentHash !== intentHash) throw conflict("Idempotency key reused with different intent");
+        return { runId: prior.runId, created: false };
+      }
+      const runId = `run-${randomUUID()}`;
+      this.database.db.insert(runRequests).values({ actor, key, intentHash, runId, createdAt: new Date().toISOString() }).run();
+      this.writeEvent(this.createEvent(runId, "run.queued", { taskId: input.intent.taskId, title: input.intent.title, trigger: input.intent.trigger }));
+      return { runId, created: true };
+    }).immediate();
+  }
+
+  contentId(item: Pick<DeliveredContentItem, "url" | "source" | "title">): string {
+    const identityKey = contentIdentityKey(item);
+    return this.database.db.select().from(contentEntities).where(eq(contentEntities.identityKey, identityKey)).get()?.id ?? `content-${fingerprint(identityKey)}`;
+  }
+
+  commitContentRun(input: { runId: string; items: DeliveredContentItem[]; maxItems: number }) {
+    const runId = this.redactor.identifier(input.runId);
+    const maxItems = z.number().int().min(0).max(100).parse(input.maxItems);
+    const items = input.items.map((raw) => contentResultSchema.parse(this.redactor.value(raw)));
+    if (items.some((item) => item.runId !== runId)) throw conflict("Content result run binding does not match");
+    const inputHash = fingerprint({ items: items.map(({ createdAt: _time, ...item }) => item), maxItems });
+    return this.database.sqlite.transaction(() => {
+      const prior = this.readRunResult(runId);
+      if (prior) {
+        if (prior.inputHash !== inputHash) throw conflict("Run result was already committed with different input");
+        return prior;
+      }
+      const events = this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.runId, runId)).orderBy(asc(runtimeEvents.sequence)).all();
+      const started = events.find((event) => event.type === "run.started");
+      if (!started || events.some((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type))) throw conflict("Run is not accepting content results");
+      const payload = z.record(z.string(), z.json()).parse(JSON.parse(started.payloadJson));
+      const scope = payload.trigger === "demo" || payload.mode === "demo" ? "demo" : "workspace";
+      const createdAt = new Date().toISOString();
+      const deliveryIds: string[] = [];
+      const delivered: DeliveredContentItem[] = [];
+      const seen = new Set<string>();
+      for (const [position, item] of items.entries()) {
+        const identityKey = contentIdentityKey(item);
+        if (seen.has(identityKey)) continue;
+        seen.add(identityKey);
+        const id = this.contentId(item);
+        this.database.db.insert(contentEntities).values({ id, identityKey, createdAt }).onConflictDoNothing({ target: contentEntities.identityKey }).run();
+        const previousDelivery = this.database.db.select().from(contentDeliveries).where(and(eq(contentDeliveries.scope, scope), eq(contentDeliveries.channel, "inbox"), eq(contentDeliveries.contentId, id))).get();
+        const status: DeliveredContentItem["status"] = item.status === "filtered" || item.status === "failed" ? item.status : previousDelivery ? "already_delivered" : delivered.length >= maxItems ? "filtered" : "delivered";
+        const result = { ...item, id, status };
+        this.database.db.insert(runContentResults).values({ ...result, evidenceJson: JSON.stringify(item.evidence), position }).run();
+        if (status === "delivered") {
+          const deliveryId = randomUUID();
+          this.database.db.insert(contentDeliveries).values({ id: deliveryId, runId, contentId: id, scope, channel: "inbox", provenance: scope === "demo" ? "demo" : "runtime", createdAt }).run();
+          deliveryIds.push(deliveryId);
+          delivered.push(result);
+        }
+      }
+      const outcome = delivered.length > 0 ? "delivered" : "no_new_items";
+      const digest = delivered.map((item, index) => `${index + 1}. ${item.title} (${item.score})`).join("\n");
+      this.database.db.insert(runReceipts).values({ runId, inputHash, outcome, digest, itemCount: seen.size, deliveredCount: delivered.length, provenance: scope === "demo" ? "demo" : "runtime", createdAt }).run();
+      this.writeEvent(this.createEvent(runId, delivered.length > 0 ? "delivery.created" : "delivery.skipped", {
+        count: delivered.length, digest, deliveryIds, ...(delivered.length === 0 ? { reason: "no_new_items" } : {}),
+        detail: delivered.length > 0 ? "New items committed to inbox" : "No new items; previously delivered content retained in this run",
+      }));
+      this.writeEvent(this.createEvent(runId, "run.completed", { outcome, durationMs: Math.max(0, Date.now() - Date.parse(started.timestamp)) }));
+      const receipt = this.readRunResult(runId);
+      if (!receipt) throw new Error("Committed run receipt is missing");
+      return receipt;
+    }).immediate();
   }
 
   async listContentItems(runId?: string): Promise<DeliveredContentItem[]> {
+    return this.readContentItems(runId);
+  }
+
+  private readContentItems(runId?: string): DeliveredContentItem[] {
     const rows = runId
-      ? await this.database.db.select().from(contentItems).where(eq(contentItems.runId, runId)).orderBy(asc(contentItems.createdAt))
-      : await this.database.db.select().from(contentItems).orderBy(asc(contentItems.createdAt));
-    return rows.map((row) => ({
+      ? this.database.db.select().from(runContentResults).where(eq(runContentResults.runId, runId)).orderBy(asc(runContentResults.position)).all()
+      : this.database.db.select().from(runContentResults).orderBy(asc(runContentResults.createdAt), asc(runContentResults.position)).all();
+    return rows.map((row) => contentResultSchema.parse({
       id: row.id,
       runId: row.runId,
       title: row.title,
@@ -815,26 +890,34 @@ export class SQLiteRuntimeStore {
       summary: row.summary,
       reason: row.reason,
       score: row.score,
-      status: row.status as DeliveredContentItem["status"],
-      evidence: JSON.parse(row.evidenceJson) as string[],
+      status: row.status,
+      evidence: JSON.parse(row.evidenceJson),
       createdAt: row.createdAt,
     }));
   }
 
-  async ensureSeeded(): Promise<void> {
+  readRunResult(runId: string) {
+    const receipt = this.database.db.select().from(runReceipts).where(eq(runReceipts.runId, runId)).get();
+    if (!receipt) return undefined;
+    return { ...receipt, outcome: outcomeSchema.parse(receipt.outcome), items: this.readContentItems(runId), deliveries: this.database.db.select().from(contentDeliveries).where(eq(contentDeliveries.runId, runId)).all() };
+  }
+
+  async seedDemo(): Promise<void> {
     await this.seedSchedules();
     if ((await this.listRuns()).length > 0) return;
     await runDemoAgent(this, { trigger: "demo", delayMs: 0 });
   }
 
   async snapshot(): Promise<RuntimeSnapshot> {
-    await this.ensureSeeded();
-    const [events, runs, runtimeSchedules, allContentItems, memory, evals, audit] = await Promise.all([this.listEvents(), this.listRuns(), this.readSchedules(), this.listContentItems(), this.readMemory(), this.listEvalReports(), this.listSecurityAudit()]);
-    const latestRun = runs[0];
+    const [runtimeSchedules, memory, evals, audit] = await Promise.all([this.readSchedules(), this.readMemory(), this.listEvalReports(), this.listSecurityAudit()]);
+    const { events, latestRun, runContentItems, receipt } = this.database.sqlite.transaction(() => {
+      const events = this.readEvents();
+      const latestRun = projectRuns(events)[0];
+      return { events, latestRun, runContentItems: latestRun ? this.readContentItems(latestRun.id) : [], receipt: latestRun ? this.readRunResult(latestRun.id) : undefined };
+    })();
     const runEvents = latestRun ? events.filter((event) => event.runId === latestRun.id) : [];
     const projectedSpans = runEvents.map(spanFromEvent).filter((span): span is RuntimeSpan => Boolean(span));
     const spans = latestRun ? [rootSpanFromRun(latestRun, runEvents), ...projectedSpans] : projectedSpans;
-    const runContentItems = latestRun ? allContentItems.filter((item) => item.runId === latestRun.id) : [];
     const stepsById = new Map<string, RuntimeStep>();
     for (const step of runEvents.map(stepFromEvent).filter((value): value is RuntimeStep => Boolean(value))) {
       stepsById.set(step.id, { ...stepsById.get(step.id), ...step });
@@ -844,7 +927,7 @@ export class SQLiteRuntimeStore {
       agent: {
         name: "Personalized Content Agent",
         status: latestRun?.status === "running" ? "running" : latestRun?.status === "failed" ? "failed" : "idle",
-        mode: "local",
+        mode: runEvents.some((event) => event.type === "run.started" && (event.payload.mode === "demo" || event.payload.trigger === "demo")) ? "demo" : "local",
       },
       latestRun,
       schedules: runtimeSchedules,
@@ -855,24 +938,30 @@ export class SQLiteRuntimeStore {
       evals: evals.length > 0 ? evals : defaultEvals(),
       security: projectSecurity(audit),
       contentItems: runContentItems,
-      pipeline: projectPipeline(runEvents, runContentItems),
+      pipeline: { ...projectPipeline(runEvents, runContentItems), ...(receipt ? { outcome: receipt.outcome, digest: receipt.digest } : {}) },
       events: events.slice(-80).reverse(),
     };
   }
 }
 
+function projectRuns(events: RuntimeEvent[]): RuntimeRun[] {
+  const runIds = [...new Set(events.filter((event) => event.type === "run.started" || event.type === "run.queued").map((event) => event.runId))].reverse();
+  return runIds.map((runId) => projectRun(runId, events.filter((event) => event.runId === runId)));
+}
+
 function projectRun(runId: string, events: RuntimeEvent[]): RuntimeRun {
   const started = events.find((event) => event.type === "run.started");
-  const completed = [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.failed");
-  const status: RunStatus = completed?.type === "run.completed" ? "completed" : completed?.type === "run.failed" ? "failed" : "running";
+  const requested = started ?? events.find((event) => event.type === "run.queued");
+  const completed = [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.failed" || event.type === "run.cancelled");
+  const status: RunStatus = completed?.type === "run.completed" ? "completed" : completed?.type === "run.failed" ? "failed" : completed?.type === "run.cancelled" ? "cancelled" : started ? "running" : "queued";
   const costUsd = events.reduce((sum, event) => sum + Number(event.payload.costUsd ?? 0), 0);
   const inputTokens = events.reduce((sum, event) => sum + Number(event.payload.inputTokens ?? 0), 0);
   const outputTokens = events.reduce((sum, event) => sum + Number(event.payload.outputTokens ?? 0), 0);
   return {
     id: runId,
-    taskId: String(started?.payload.taskId ?? "daily-social-brief"),
-    title: String(started?.payload.title ?? "Daily social brief"),
-    trigger: (started?.payload.trigger as RuntimeRun["trigger"] | undefined) ?? "manual",
+    taskId: String(requested?.payload.taskId ?? "content"),
+    title: String(requested?.payload.title ?? "Content run"),
+    trigger: z.enum(["manual", "schedule", "demo"]).parse(requested?.payload.trigger ?? "manual"),
     status,
     startedAt: started?.timestamp,
     completedAt: completed?.timestamp,
@@ -936,12 +1025,8 @@ function contentHash(value: string): number {
   return Math.abs(result);
 }
 
-function slugify(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 96);
-}
-
 function stableContentId(item: RawContentItem): string {
-  return slugify(item.url ?? `${item.source}-${item.title}`) || `item-${contentHash(`${item.source}:${item.title}:${item.text}`)}`;
+  return `content-${fingerprint(contentIdentityKey(item))}`;
 }
 
 function cleanContent(item: RawContentItem): RawContentItem {
@@ -961,7 +1046,7 @@ function dedupeContent(items: RawContentItem[]): RawContentItem[] {
   const byUrl = new Map<string, RawContentItem>();
   const bySimilarity = new Map<string, RawContentItem>();
   for (const item of items.map(cleanContent).filter((candidate) => candidate.title && candidate.text)) {
-    const urlKey = item.url?.toLowerCase();
+    const urlKey = item.url ? contentIdentityKey(item) : undefined;
     if (urlKey && byUrl.has(urlKey)) continue;
     const similar = similarityKey(item);
     if (similar && bySimilarity.has(similar)) {
@@ -980,7 +1065,7 @@ function summarizeContent(item: RawContentItem): string {
   return text.length <= 240 ? text : `${text.slice(0, 237).trim()}...`;
 }
 
-function rankContent(item: RawContentItem, memory: MemoryState): DeliveredContentItem {
+function rankContent(item: RawContentItem, memory: MemoryState, id = stableContentId(item)): DeliveredContentItem {
   const text = `${item.title} ${item.text}`.toLowerCase();
   const evidence: string[] = [];
   let score = 50;
@@ -999,7 +1084,6 @@ function rankContent(item: RawContentItem, memory: MemoryState): DeliveredConten
   const weight = memory.sourceWeights[item.source] ?? 1;
   score += Math.round(weight * 10);
   evidence.push(`source weight: ${weight}`);
-  const id = stableContentId(item);
   for (const signal of memory.recentFeedback.filter((entry) => entry.itemId === id)) {
     if (signal.signal === "clicked") {
       score += 8;
@@ -1102,8 +1186,15 @@ async function fetchContentSource(source: ContentSource, options: ContentPipelin
     : [{ source: source.id, title: page.title, url: page.url, text: page.text }];
 }
 
-export async function runContentPipeline(store: RuntimeEventStore, runId: string, options: ContentPipelineOptions = {}): Promise<DeliveredContentItem[]> {
-  options = { ...options, network: options.network ?? (store instanceof SQLiteRuntimeStore ? store.network : undefined) };
+export async function runContentPipeline(store: SQLiteRuntimeStore, runId: string, options: ContentPipelineOptions = {}): Promise<DeliveredContentItem[]> {
+  const receipt = store.readRunResult(runId);
+  if (receipt) return receipt.items;
+  const previousEvents = await store.listEvents(runId);
+  if (previousEvents.some((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type))) throw conflict("Run is already terminal");
+  if (!previousEvents.some((event) => event.type === "run.started")) {
+    await store.appendEvent(store.createEvent(runId, "run.started", { title: "Content run", taskId: "content", trigger: "manual" }));
+  }
+  options = { ...options, network: options.network ?? store.network };
   const sources = options.sources ?? defaultContentSources();
   const emit = async (type: RuntimeEventType, payload: Record<string, unknown>, eventOptions?: { severity?: Severity }) => {
     await store.appendEvent(store.createEvent(runId, type, payload, { source: "content-pipeline", severity: eventOptions?.severity }));
@@ -1119,14 +1210,18 @@ export async function runContentPipeline(store: RuntimeEventStore, runId: string
       await emit("pipeline.fetch.completed", { source: source.id, failedSources: [source.id], detail: error instanceof Error ? error.message : String(error) }, { severity: "warning" });
     }
   }
-  if (fetched.length === 0) throw new Error(`All content sources failed: ${failedSources.join(", ") || "none"}`);
+  if (sources.length === 0 || failedSources.length === sources.length) {
+    const detail = `All content sources failed: ${failedSources.join(", ") || "none configured"}`;
+    await emit("run.failed", { reason: "sources_failed", detail }, { severity: "error" });
+    throw new Error(detail);
+  }
   await emit("pipeline.fetch.completed", { count: fetched.length, failedSources, durationMs: 420, detail: `Fetched ${fetched.length} candidate items` });
   const cleaned = fetched.map(cleanContent).filter((item) => item.title && item.text);
   await emit("pipeline.clean.completed", { count: cleaned.length, durationMs: 90, detail: "Normalized titles, text, and URLs" });
   const unique = dedupeContent(cleaned);
   await emit("pipeline.dedupe.completed", { count: unique.length, removed: cleaned.length - unique.length, durationMs: 70, detail: "Canonical URL and similarity dedupe" });
-  const memory = "readMemory" in store && typeof store.readMemory === "function" ? await (store as SQLiteRuntimeStore).readMemory() : defaultMemory();
-  const ranked = unique.map((item) => rankContent(item, memory)).sort((left, right) => right.score - left.score).slice(0, options.maxItems ?? 5);
+  const memory = await store.readMemory();
+  const ranked = unique.map((item) => rankContent(item, memory, store.contentId(item))).sort((left, right) => right.score - left.score);
   await emit("pipeline.rank.completed", { count: ranked.length, durationMs: 140, detail: "Preference and evidence weighted ranking" });
   const estimatedLlm = { durationMs: 860, inputTokens: 2380, outputTokens: 640, costUsd: 0.0029, model: "deepseek-compatible" };
   const overflowReasons = [
@@ -1149,12 +1244,8 @@ export async function runContentPipeline(store: RuntimeEventStore, runId: string
     degraded,
     detail: degraded ? `Budget overflow degraded summary: ${overflowReasons.join(", ")}` : "Extractive structured summaries created",
   }, { severity: degraded ? "warning" : "info" });
-  const digest = delivered.map((item, index) => `${index + 1}. ${item.title} (${item.score})`).join("\n");
-  await emit("delivery.created", { count: delivered.length, durationMs: 65, digest, detail: "Dashboard inbox item created" });
-  if ("insertContentItems" in store && typeof store.insertContentItems === "function") {
-    await (store as SQLiteRuntimeStore).insertContentItems(delivered);
-  }
-  return delivered;
+  options.signal?.throwIfAborted();
+  return store.commitContentRun({ runId, items: delivered, maxItems: options.maxItems ?? 5 }).items;
 }
 
 function parseIntervalMs(value: string): number | undefined {
@@ -1226,16 +1317,23 @@ export class RuntimeScheduler {
     return results;
   }
 
-  async runNow(scheduleId?: string): Promise<string> {
-    if (!scheduleId) {
-      return runDemoAgent(this.options.runtime, { trigger: "manual", delayMs: 0 });
+  async runNow(scheduleId?: string, request: { actor: string; key: string } = { actor: "local", key: randomUUID() }): Promise<string> {
+    const schedule = scheduleId ? (await this.options.runtime.readSchedules()).find((candidate) => candidate.id === scheduleId) : undefined;
+    if (scheduleId && !schedule) throw new Error(`Schedule not found: ${scheduleId}`);
+    const intent = { taskId: schedule?.id ?? "manual-content", title: schedule?.title ?? "Content run", trigger: "manual" as const };
+    const admission = this.options.runtime.admitRun({ ...request, intent });
+    if (!admission.created) return admission.runId;
+    try {
+      if (!schedule) return await runDemoAgent(this.options.runtime, { runId: admission.runId, trigger: "manual", delayMs: 0 });
+      if (!schedule.enabled) throw new Error(`Schedule is paused: ${scheduleId}`);
+      const result = await this.triggerSchedule(schedule, "manual", this.now(), admission.runId);
+      if (result.status !== "started") throw new Error(`Schedule did not start: ${result.reason}`);
+      return result.runId;
+    } catch (error) {
+      const run = await this.options.runtime.projectRun(admission.runId);
+      if (run.status === "queued" || run.status === "running") await this.options.runtime.appendEvent(this.options.runtime.createEvent(admission.runId, "run.failed", { reason: "execution_failed", detail: error instanceof Error ? error.message : String(error) }, { severity: "error" }));
+      throw error;
     }
-    const schedule = (await this.options.runtime.readSchedules()).find((candidate) => candidate.id === scheduleId);
-    if (!schedule) throw new Error(`Schedule not found: ${scheduleId}`);
-    if (!schedule.enabled) throw new Error(`Schedule is paused: ${scheduleId}`);
-    const result = await this.triggerSchedule(schedule, "manual", this.now());
-    if (result.status !== "started") throw new Error(`Schedule did not start: ${result.reason}`);
-    return result.runId;
   }
 
   start(): void {
@@ -1257,7 +1355,7 @@ export class RuntimeScheduler {
     return this.options.now?.() ?? new Date();
   }
 
-  private async triggerSchedule(schedule: RuntimeSchedule, reason: "due" | "manual" | "queued", now: Date): Promise<SchedulerRunResult> {
+  private async triggerSchedule(schedule: RuntimeSchedule, reason: "due" | "manual" | "queued", now: Date, admittedRunId?: string): Promise<SchedulerRunResult> {
     if (!schedule.enabled) {
       await this.options.runtime.appendEvent(this.options.runtime.createEvent(`schedule-${Date.now().toString(36)}`, "scheduler.task_due", {
         scheduleId: schedule.id,
@@ -1298,11 +1396,11 @@ export class RuntimeScheduler {
       }, { source: "scheduler", severity: "warning" }));
     }
 
-    return this.startScheduleRun(schedule, schedule.overlapPolicy === "cancel_previous" && active ? "cancel_previous" : reason, now);
+    return this.startScheduleRun(schedule, schedule.overlapPolicy === "cancel_previous" && active ? "cancel_previous" : reason, now, admittedRunId);
   }
 
-  private async startScheduleRun(schedule: RuntimeSchedule, reason: "due" | "manual" | "queued" | "cancel_previous", now: Date): Promise<SchedulerRunResult> {
-    const runId = `run-${schedule.id}-${Date.now().toString(36)}`;
+  private async startScheduleRun(schedule: RuntimeSchedule, reason: "due" | "manual" | "queued" | "cancel_previous", now: Date, admittedRunId?: string): Promise<SchedulerRunResult> {
+    const runId = admittedRunId ?? `run-${randomUUID()}`;
     await this.options.runtime.markScheduleTriggered(schedule.id, runId, now, reason);
     const run = this.runAgent({ runId, schedule, trigger: "schedule", emitSchedulerEvent: false });
     this.activeRuns.set(schedule.id, run);
@@ -1422,13 +1520,12 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function runDemoAgent(store: RuntimeEventStore, options: DemoAgentRunOptions = {}): Promise<string> {
-  const runId = options.runId ?? `run-${Date.now().toString(36)}`;
+export async function runDemoAgent(store: SQLiteRuntimeStore, options: DemoAgentRunOptions = {}): Promise<string> {
+  const runId = options.runId ?? `run-${randomUUID()}`;
   const delayMs = options.delayMs ?? 180;
   const taskId = options.taskId ?? "daily-social-brief";
   const title = options.title ?? "Daily social brief";
   const trigger = options.trigger ?? "manual";
-  const startedAt = Date.now();
   const emit = async (type: RuntimeEventType, payload: Record<string, unknown>, eventOptions?: { source?: string; severity?: Severity }) => {
     await store.appendEvent(store.createEvent(runId, type, payload, eventOptions));
     await sleep(delayMs);
@@ -1437,11 +1534,7 @@ export async function runDemoAgent(store: RuntimeEventStore, options: DemoAgentR
   if (options.emitSchedulerEvent !== false) {
     await emit("scheduler.task_due", { taskId, trigger, detail: options.schedulerDetail ?? "Manual trigger accepted by scheduler" }, { source: "scheduler" });
   }
-  await emit("run.started", { taskId, title, trigger }, { source: "orchestrator" });
+  await emit("run.started", { taskId, title, trigger, mode: "demo" }, { source: "orchestrator" });
   await runContentPipeline(store, runId);
-  await emit("memory.preference.updated", { durationMs: 35, detail: "Saved feedback reinforced agent observability and scheduler runtime topics" }, { source: "memory" });
-  await emit("security.policy.checked", { durationMs: 24, detail: "Read-only browser and delivery tools allowed; high-risk publish tool denied by policy" }, { source: "security" });
-  await emit("eval.completed", { passed: 4, failed: 0, durationMs: 310, detail: "Runtime replay, tool order, memory feedback, and secret redaction gates passed" }, { source: "eval" });
-  await emit("run.completed", { durationMs: Date.now() - startedAt, detail: "Agent run completed" }, { source: "orchestrator" });
   return runId;
 }

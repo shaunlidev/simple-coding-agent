@@ -49,6 +49,15 @@ These use isolated SQLite, synthetic secrets and actual Chromium. The browser se
 
 ## Coverage
 
+R3 consistency verification after building the API and dashboard:
+
+```bash
+node --experimental-transform-types --test packages/db/test/migrations.test.ts packages/runtime/test/consistency.test.ts packages/server/test/consistency.test.ts
+node scripts/verify-consistency.mjs
+```
+
+The script starts the actual API entry in a child process against an isolated file database, performs three UI runs, selects historical results, checks mobile overflow, stops/restarts the child and compares the persisted result. It then checks raw result/delivery/event counts. It uses the explicitly labeled demo executor with no provider key. Reports/screenshots are under `artifacts/acceptance/R3/`; temporary databases and processes are cleaned up. Tests inject a failing SQLite trigger to prove rollback and import fixtures from both baseline schema variants. Old unsupported/corrupt schemas must fail instead of silently resetting data.
+
 - Unit tests cover pure logic and protocol contracts.
 - Faux provider tests prove test infrastructure before agent tests depend on it.
 - Agent harness tests assert transcripts, event order, tool calls, and final output.
