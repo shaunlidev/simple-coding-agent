@@ -1,0 +1,294 @@
+import cors from "@fastify/cors";
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { RuntimeScheduler, SQLiteRuntimeStore, type MemoryEntryInput, type RuntimeSchedule } from "@simple-coding-agent/runtime";
+import { evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
+import { z } from "zod";
+
+export type AgentOpsServerOptions = {
+  env?: Record<string, string | undefined>;
+  logger?: boolean;
+  startScheduler?: boolean;
+};
+
+const createScheduleSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  cron: z.string().min(1),
+  timezone: z.string().min(1).default("Asia/Shanghai"),
+  enabled: z.boolean().default(true),
+  nextRunAt: z.string().min(1).optional(),
+  overlapPolicy: z.enum(["skip", "queue", "cancel_previous"]).default("skip"),
+});
+
+const patchScheduleSchema = z.object({
+  enabled: z.boolean().optional(),
+  cron: z.string().min(1).optional(),
+  timezone: z.string().min(1).optional(),
+  nextRunAt: z.string().min(1).optional(),
+  lastRunAt: z.string().min(1).optional(),
+  overlapPolicy: z.enum(["skip", "queue", "cancel_previous"]).optional(),
+});
+
+const schedulerTickSchema = z.object({
+  now: z.string().datetime().optional(),
+});
+
+const feedbackSchema = z.object({
+  itemId: z.string().min(1),
+  signal: z.enum(["clicked", "saved", "not_interested", "dismissed"]),
+});
+
+const memoryEntrySchema = z.object({
+  kind: z.enum(["preference", "blocked_topic", "source_weight", "lesson", "knowledge"]),
+  sourceTrust: z.enum(["user", "system", "trusted_tool", "external"]),
+  content: z.string().min(1),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+
+const toolCheckSchema = z.object({
+  toolName: z.string().min(1),
+  url: z.string().url().optional(),
+  approved: z.boolean().default(false),
+});
+
+const secretScanSchema = z.object({
+  text: z.string(),
+});
+
+function errorEnvelope(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    error: {
+      code: "AGENT_OPS_ERROR",
+      message: redactSecrets(message),
+    },
+  };
+}
+
+function redactForResponse<T>(value: T): T {
+  return JSON.parse(redactSecrets(JSON.stringify(value))) as T;
+}
+
+async function sendSseSnapshot(reply: FastifyReply, runtime: SQLiteRuntimeStore, closeAfterFirst: boolean) {
+  const snapshot = redactForResponse(await runtime.snapshot());
+  reply.raw.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+  for (const event of snapshot.events.slice().reverse()) {
+    reply.raw.write(`event: runtime-event\ndata: ${JSON.stringify(event)}\n\n`);
+  }
+  if (closeAfterFirst) reply.raw.end();
+}
+
+export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) {
+  const env = parseEnvironment(options.env ?? process.env);
+  if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
+  const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH === ":memory:" ? ":memory:" : env.AGENT_DB_PATH });
+  const scheduler = new RuntimeScheduler({ runtime });
+  const urlAllowlist = parseUrlAllowlist(env.AGENT_URL_ALLOWLIST);
+  const app = Fastify({ logger: options.logger ?? false });
+
+  app.setErrorHandler((error, _request, reply) => {
+    const candidate = error as { statusCode?: number };
+    const statusCode = candidate.statusCode && candidate.statusCode >= 400 && candidate.statusCode < 600 ? candidate.statusCode : 500;
+    reply.status(statusCode).send(errorEnvelope(error));
+  });
+
+  await app.register(cors, { origin: env.AGENT_CORS_ORIGIN === "*" ? true : env.AGENT_CORS_ORIGIN });
+
+  app.get("/healthz", async () => ({ ok: true }));
+
+  app.get("/readyz", async () => {
+    await runtime.ensureSeeded();
+    return { ok: true, database: "connected" };
+  });
+
+  app.get("/api/snapshot", async () => redactForResponse(await runtime.snapshot()));
+
+  app.get("/api/runs", async () => ({ runs: await runtime.listRuns() }));
+
+  app.get("/api/runs/:id", async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
+    const events = await runtime.listEvents(request.params.id);
+    if (events.length === 0) {
+      reply.status(404);
+      return { error: { code: "RUN_NOT_FOUND", message: "Run not found" } };
+    }
+    return redactForResponse({ run: await runtime.projectRun(request.params.id), events });
+  });
+
+  app.get("/api/events", async (request) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    const severity = url.searchParams.get("severity");
+    const source = url.searchParams.get("source");
+    const runId = url.searchParams.get("runId") ?? undefined;
+    const events = await runtime.listEvents(runId);
+    return {
+      events: redactForResponse(events.filter((event) =>
+        (!severity || event.severity === severity) &&
+        (!source || event.source === source),
+      )),
+    };
+  });
+
+  if (options.startScheduler) scheduler.start();
+  app.addHook("onClose", async () => scheduler.stop());
+
+  app.post("/api/runs/run-now", async () => {
+    const runId = await scheduler.runNow();
+    return { accepted: true, runId };
+  });
+
+  app.post("/api/schedules/:id/run-now", async (request: FastifyRequest<{ Params: { id: string } }>) => {
+    const runId = await scheduler.runNow(request.params.id);
+    return { accepted: true, runId };
+  });
+
+  app.post("/api/scheduler/tick", async (request, reply) => {
+    const parsed = schedulerTickSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: { code: "INVALID_SCHEDULER_TICK", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    const results = await scheduler.tick(parsed.data.now ? new Date(parsed.data.now) : new Date());
+    return { results };
+  });
+
+  app.get("/api/events/stream", async (request, reply) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    const once = url.searchParams.get("once") === "1";
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      connection: once ? "close" : "keep-alive",
+    });
+    await sendSseSnapshot(reply, runtime, once);
+    if (once) return reply;
+    const timer = setInterval(() => {
+      sendSseSnapshot(reply, runtime, false).catch((error) => {
+        reply.raw.write(`event: runtime-error\ndata: ${JSON.stringify(errorEnvelope(error))}\n\n`);
+      });
+    }, 1000);
+    request.raw.on("close", () => clearInterval(timer));
+    return reply;
+  });
+
+  app.get("/api/schedules", async () => ({ schedules: await runtime.readSchedules() }));
+
+  app.get("/api/security/audit", async () => redactForResponse({
+    audit: await runtime.listSecurityAudit(),
+    approvals: await runtime.listToolApprovals(),
+  }));
+
+  app.post("/api/security/tool-check", async (request, reply) => {
+    const parsed = toolCheckSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: { code: "INVALID_TOOL_CHECK", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    const decision = evaluateToolCall({ ...parsed.data, allowlist: urlAllowlist });
+    await runtime.recordToolApproval({
+      tool: decision.tool,
+      risk: decision.risk,
+      status: decision.allowed ? "approved" : "denied",
+      reason: redactSecrets(decision.reason),
+    });
+    if (!decision.allowed) {
+      await runtime.recordSecurityAudit({
+        action: decision.tool,
+        severity: "warning",
+        message: redactSecrets(decision.reason),
+      });
+      reply.status(403);
+    }
+    return redactForResponse({ decision });
+  });
+
+  app.post("/api/security/secret-scan", async (request, reply) => {
+    const parsed = secretScanSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: { code: "INVALID_SECRET_SCAN", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    const result = scanForSecrets(parsed.data.text);
+    await runtime.recordSecurityAudit({
+      action: "secret_scan",
+      severity: result.passed ? "info" : "error",
+      message: result.passed ? "Secret scan passed" : `Secret scan found ${result.findings.length} finding(s)`,
+    });
+    return redactForResponse(result);
+  });
+
+  app.get("/api/memory/export", async () => await runtime.exportMemory());
+
+  app.delete("/api/memory", async () => {
+    await runtime.clearMemory();
+    return { ok: true };
+  });
+
+  app.get("/api/memory/search", async (request, reply) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    const q = url.searchParams.get("q")?.trim();
+    if (!q) {
+      reply.status(400);
+      return { error: { code: "INVALID_MEMORY_QUERY", message: "q is required" } };
+    }
+    return { results: await runtime.searchMemory(q) };
+  });
+
+  app.post("/api/memory/feedback", async (request, reply) => {
+    const parsed = feedbackSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: { code: "INVALID_FEEDBACK", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    await runtime.recordFeedback(parsed.data.itemId, parsed.data.signal);
+    return { ok: true, memory: await runtime.readMemory() };
+  });
+
+  app.post("/api/memory/entries", async (request, reply) => {
+    const parsed = memoryEntrySchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: { code: "INVALID_MEMORY_ENTRY", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    try {
+      return await runtime.writeMemoryEntry(parsed.data as MemoryEntryInput);
+    } catch (error) {
+      await runtime.appendEvent(runtime.createEvent(`memory-denied-${Date.now().toString(36)}`, "security.policy.denied", {
+        action: "memory.write",
+        reason: error instanceof Error ? redactSecrets(error.message) : redactSecrets(String(error)),
+      }, { source: "security", severity: "warning" }));
+      reply.status(400);
+      return { error: { code: "MEMORY_WRITE_DENIED", message: error instanceof Error ? redactSecrets(error.message) : "Memory write denied" } };
+    }
+  });
+
+  app.post("/api/schedules", async (request, reply) => {
+    const parsed = createScheduleSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: { code: "INVALID_SCHEDULE", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    const schedule: RuntimeSchedule = {
+      id: parsed.data.id,
+      title: parsed.data.title,
+      enabled: parsed.data.enabled,
+      cron: parsed.data.cron,
+      timezone: parsed.data.timezone,
+      nextRunAt: parsed.data.nextRunAt ?? new Date().toISOString(),
+      overlapPolicy: parsed.data.overlapPolicy,
+    };
+    return await runtime.createSchedule(schedule);
+  });
+
+  app.patch("/api/schedules/:id", async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
+    const parsed = patchScheduleSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return { error: { code: "INVALID_SCHEDULE_PATCH", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
+    }
+    return await runtime.updateSchedule(request.params.id, parsed.data);
+  });
+
+  return { app, runtime, scheduler, database: runtime.database };
+}

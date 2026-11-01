@@ -5,6 +5,12 @@ import {
   createDefaultRuntime,
   CliUsageError,
   SESSION_RECORD_VERSION,
+  createScheduledTask,
+  formatTaskList,
+  listScheduledTasks,
+  recordTaskFeedback,
+  runScheduledTask,
+  updatePreferences,
   workflowCaptureRequirement,
   workflowCreatePlan,
   workflowListBacklog,
@@ -91,6 +97,14 @@ Interactive commands:
   /plan [ID]       Create an active implementation plan
   /verify ID | passed|failed|blocked | SUMMARY | CMD1; CMD2
                    Record verification evidence
+  /tasks           List scheduled content tasks
+  /task-create ID | EVERY | SOURCE | URL | QUERY
+                   Create a scheduled content task
+  /task-run ID     Run a scheduled content task now
+  /feedback TASK ITEM SIGNAL
+                   Record clicked, saved, not_interested, or dismissed
+  /preferences INTERESTS | BLOCKED
+                   Set comma-separated interests and blocked topics
 `;
 
 const INTERACTIVE_HELP = `Commands:
@@ -105,6 +119,11 @@ const INTERACTIVE_HELP = `Commands:
   /backlog
   /plan [ID]
   /verify ID | passed|failed|blocked | SUMMARY | CMD1; CMD2
+  /tasks
+  /task-create ID | EVERY | SOURCE | URL | QUERY
+  /task-run ID
+  /feedback TASK ITEM SIGNAL
+  /preferences INTERESTS | BLOCKED
 `;
 
 function assistantText(message: AssistantMessage): string {
@@ -404,6 +423,67 @@ async function runWorkflowCommand(name: string, value: string, state: TuiState, 
   return false;
 }
 
+async function runTaskCommand(name: string, value: string, state: TuiState, io: CliIo): Promise<boolean> {
+  const runtime = workflowRoot(state);
+  if (name === "/tasks") {
+    io.stdout.write(`${styles.label("Tasks")}\n${indent(formatTaskList(await listScheduledTasks(runtime)))}\n`);
+    return true;
+  }
+  if (name === "/task-create") {
+    const [id, every, source, url, query] = splitWorkflowArgs(value);
+    if (!id) {
+      io.stderr.write("/task-create requires ID | EVERY | SOURCE | URL | QUERY\n");
+      return true;
+    }
+    const task = await createScheduledTask(
+      {
+        id,
+        every: every || undefined,
+        source: source === "browser" || source === "rss" || source === "mock" ? source : undefined,
+        url: url || undefined,
+        query: query || undefined,
+      },
+      runtime,
+    );
+    io.stdout.write(`${styles.label("Tasks")}\n${indent(`Created task ${task.id}`)}\n`);
+    return true;
+  }
+  if (name === "/task-run") {
+    const id = value.trim();
+    if (!id) {
+      io.stderr.write("/task-run requires ID\n");
+      return true;
+    }
+    const result = await runScheduledTask(id, runtime);
+    io.stdout.write(`${styles.label("Tasks")}\n${indent(`Ran ${result.taskId}: ${result.itemCount} items\nDigest: ${result.digestPath}`)}\n`);
+    return true;
+  }
+  if (name === "/feedback") {
+    const [taskId, itemId, signal] = value.trim().split(/\s+/);
+    if (!taskId || !itemId || !signal) {
+      io.stderr.write("/feedback requires TASK ITEM SIGNAL\n");
+      return true;
+    }
+    if (signal !== "clicked" && signal !== "saved" && signal !== "not_interested" && signal !== "dismissed") {
+      io.stderr.write("/feedback signal must be clicked, saved, not_interested, or dismissed\n");
+      return true;
+    }
+    await recordTaskFeedback({ taskId, itemId, signal }, runtime);
+    io.stdout.write(`${styles.label("Tasks")}\n${indent(`Recorded ${signal} for ${itemId}`)}\n`);
+    return true;
+  }
+  if (name === "/preferences") {
+    const [interests, blocked] = splitWorkflowArgs(value);
+    const memory = await updatePreferences(runtime, {
+      interests: splitList(interests?.replaceAll(",", ";")),
+      blockedTopics: splitList(blocked?.replaceAll(",", ";")),
+    });
+    io.stdout.write(`${styles.label("Tasks")}\n${indent(`Updated preferences: ${memory.interests.join(", ")}`)}\n`);
+    return true;
+  }
+  return false;
+}
+
 async function runInteractiveCommand(
   line: string,
   state: TuiState,
@@ -418,6 +498,9 @@ async function runInteractiveCommand(
     return "continue";
   }
   if (await runWorkflowCommand(name, value, state, io)) {
+    return "continue";
+  }
+  if (await runTaskCommand(name, value, state, io)) {
     return "continue";
   }
   if (name === "/clear") {

@@ -247,6 +247,63 @@ test("streaming SSE chunks emit text and tool deltas", async () => {
   assert.deepEqual(message.content, [{ type: "text", text: "hi there" }]);
 });
 
+test("streaming SSE accepts multiple tool calls before earlier tool calls end", async () => {
+  const provider = createDeepSeekProvider({
+    apiKey: "test-key",
+    stream: true,
+    fetch: async () =>
+      sseResponse([
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  { index: 0, id: "call-1", type: "function", function: { name: "read", arguments: '{"path":' } },
+                ],
+              },
+            },
+          ],
+        },
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  { index: 1, id: "call-2", type: "function", function: { name: "bash", arguments: '{"command":' } },
+                ],
+              },
+            },
+          ],
+        },
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  { index: 0, function: { arguments: '"README.md"}' } },
+                  { index: 1, function: { arguments: '"pwd"}' } },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      ]),
+  });
+
+  const { events, message } = await collect(provider);
+
+  assert.deepEqual(
+    events.filter((event) => event.type === "tool_call_start").map((event) => event.name),
+    ["read", "bash"],
+  );
+  assert.equal(message.stopReason, "tool_call");
+  assert.deepEqual(message.content, [
+    { type: "tool_call", id: "call-1", name: "read", arguments: { path: "README.md" } },
+    { type: "tool_call", id: "call-2", name: "bash", arguments: { command: "pwd" } },
+  ]);
+});
+
 test("streaming SSE emits deltas before the response body is complete", async () => {
   const encoder = new TextEncoder();
   const secondChunk = deferred();

@@ -5,8 +5,15 @@
     "moduleResolution": "NodeNext",
     "strict": true,
     "noEmit": true,
+    "jsx": "react-jsx",
     "allowImportingTsExtensions": true,
+    "baseUrl": ".",
+    "paths": {
+      "@simple-coding-agent/db": ["packages/db/src/index.ts"],
+      "@simple-coding-agent/runtime": ["packages/runtime/src/index.ts"],
+      "@simple-coding-agent/security": ["packages/security/src/index.ts"]
+    },
     "skipLibCheck": true
   },
-  "include": ["packages/**/*.ts", "evals/**/*.ts", "scripts/**/*.ts", "types/**/*.d.ts"]
+  "include": ["packages/**/*.ts", "packages/**/*.tsx", "evals/**/*.ts", "scripts/**/*.ts", "types/**/*.d.ts"]
 }

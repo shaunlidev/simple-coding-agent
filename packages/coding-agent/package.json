@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "simple-coding-agent": "dist/entry.js"
+    "simple-coding-agent": "dist/entry.js",
+    "simple-coding-agent-task": "dist/task-entry.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

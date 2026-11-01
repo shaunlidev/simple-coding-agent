@@ -27,8 +27,9 @@ type ActiveBlock = TextActiveBlock | ToolCallActiveBlock;
 type SequenceState = {
   phase: StreamPhase;
   nextContentIndex: number;
-  activeBlock?: ActiveBlock;
-  completedContent: AssistantContent[];
+  activeBlock?: TextActiveBlock;
+  activeToolBlocks: Map<number, ToolCallActiveBlock>;
+  completedContent: Map<number, AssistantContent>;
 };
 
 export class StreamSequenceError extends Error {
@@ -115,7 +116,7 @@ function jsonDeepEqual(left: unknown, right: unknown): boolean {
 }
 
 function getExpectedTerminalContent(state: SequenceState): AssistantContent[] {
-  const content = [...state.completedContent];
+  const content = completedContentInOrder(state);
   const active = state.activeBlock;
 
   if (active?.kind === "text") {
@@ -128,11 +129,18 @@ function getExpectedTerminalContent(state: SequenceState): AssistantContent[] {
   return content;
 }
 
+function completedContentInOrder(state: SequenceState): AssistantContent[] {
+  return [...state.completedContent.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, content]) => content);
+}
+
 export function createStreamEventValidator(): StreamEventValidator {
   const state: SequenceState = {
     phase: "idle",
     nextContentIndex: 0,
-    completedContent: [],
+    activeToolBlocks: new Map(),
+    completedContent: new Map(),
   };
 
   return {
@@ -158,12 +166,16 @@ export function createStreamEventValidator(): StreamEventValidator {
           if (state.activeBlock) {
             reject(event, state, `cannot start a new block while ${state.activeBlock.kind} is active`);
           }
+          if (state.activeToolBlocks.size > 0) {
+            reject(event, state, "cannot start a new block while tool_call is active");
+          }
           assertStartIndex(event, state, event.contentIndex);
           state.activeBlock = {
             kind: event.type === "text_start" ? "text" : "thinking",
             contentIndex: event.contentIndex,
             value: "",
           };
+          state.nextContentIndex += 1;
           return;
         }
 
@@ -171,7 +183,7 @@ export function createStreamEventValidator(): StreamEventValidator {
         case "thinking_delta": {
           const expectedKind = event.type === "text_delta" ? "text" : "thinking";
           const active = state.activeBlock;
-          if (!active || active.kind === "tool_call" || active.kind !== expectedKind) {
+          if (!active || active.kind !== expectedKind) {
             reject(event, state, `expected active ${expectedKind} block`);
           }
           if (event.contentIndex !== active.contentIndex) {
@@ -185,7 +197,7 @@ export function createStreamEventValidator(): StreamEventValidator {
         case "thinking_end": {
           const expectedKind = event.type === "text_end" ? "text" : "thinking";
           const active = state.activeBlock;
-          if (!active || active.kind === "tool_call" || active.kind !== expectedKind) {
+          if (!active || active.kind !== expectedKind) {
             reject(event, state, `expected active ${expectedKind} block`);
           }
           if (event.contentIndex !== active.contentIndex) {
@@ -194,13 +206,11 @@ export function createStreamEventValidator(): StreamEventValidator {
           if (event.content !== active.value) {
             reject(event, state, "end content does not match accumulated deltas");
           }
-          state.completedContent.push(
-            expectedKind === "text"
-              ? { type: "text", text: active.value }
-              : { type: "thinking", thinking: active.value },
+          state.completedContent.set(
+            active.contentIndex,
+            expectedKind === "text" ? { type: "text", text: active.value } : { type: "thinking", thinking: active.value },
           );
           state.activeBlock = undefined;
-          state.nextContentIndex += 1;
           return;
         }
 
@@ -209,24 +219,22 @@ export function createStreamEventValidator(): StreamEventValidator {
             reject(event, state, `cannot start a new block while ${state.activeBlock.kind} is active`);
           }
           assertStartIndex(event, state, event.contentIndex);
-          state.activeBlock = {
+          state.activeToolBlocks.set(event.contentIndex, {
             kind: "tool_call",
             contentIndex: event.contentIndex,
             id: event.id,
             name: event.name,
             argumentsJson: "",
             sawArgumentsDelta: false,
-          };
+          });
+          state.nextContentIndex += 1;
           return;
         }
 
         case "tool_call_delta": {
-          const active = state.activeBlock;
-          if (!active || active.kind !== "tool_call") {
+          const active = state.activeToolBlocks.get(event.contentIndex);
+          if (!active) {
             reject(event, state, "expected active tool_call block");
-          }
-          if (event.contentIndex !== active.contentIndex) {
-            reject(event, state, `expected contentIndex ${active.contentIndex}, received ${event.contentIndex}`);
           }
           active.sawArgumentsDelta = true;
           active.argumentsJson += event.argumentsDelta;
@@ -234,12 +242,9 @@ export function createStreamEventValidator(): StreamEventValidator {
         }
 
         case "tool_call_end": {
-          const active = state.activeBlock;
-          if (!active || active.kind !== "tool_call") {
+          const active = state.activeToolBlocks.get(event.contentIndex);
+          if (!active) {
             reject(event, state, "expected active tool_call block");
-          }
-          if (event.contentIndex !== active.contentIndex) {
-            reject(event, state, `expected contentIndex ${active.contentIndex}, received ${event.contentIndex}`);
           }
 
           let parsed: JsonObject;
@@ -274,25 +279,24 @@ export function createStreamEventValidator(): StreamEventValidator {
             reject(event, state, "final tool arguments must match accumulated arguments");
           }
 
-          state.completedContent.push({
+          state.completedContent.set(event.contentIndex, {
             type: "tool_call",
             id: active.id,
             name: active.name,
             arguments: parsed,
           });
-          state.activeBlock = undefined;
-          state.nextContentIndex += 1;
+          state.activeToolBlocks.delete(event.contentIndex);
           return;
         }
 
         case "done": {
-          if (state.activeBlock) {
+          if (state.activeBlock || state.activeToolBlocks.size > 0) {
             reject(event, state, "done cannot terminate an active block");
           }
           if (event.reason !== event.message.stopReason) {
             reject(event, state, "event reason must match message.stopReason");
           }
-          if (!jsonDeepEqual(event.message.content, state.completedContent)) {
+          if (!jsonDeepEqual(event.message.content, completedContentInOrder(state))) {
             reject(event, state, "done message content must match completed stream content");
           }
           state.phase = "terminal";

@@ -69,6 +69,48 @@ test("accepts thinking followed by a tool call", () => {
   ]);
 });
 
+test("accepts multiple streaming tool calls active by content index", () => {
+  acceptTrace([
+    { type: "start" },
+    { type: "tool_call_start", contentIndex: 0, id: "call-1", name: "read" },
+    { type: "tool_call_start", contentIndex: 1, id: "call-2", name: "bash" },
+    { type: "tool_call_delta", contentIndex: 0, argumentsDelta: '{"path":"README.md"}' },
+    { type: "tool_call_delta", contentIndex: 1, argumentsDelta: '{"command":"pwd"}' },
+    {
+      type: "tool_call_end",
+      contentIndex: 1,
+      toolCall: {
+        type: "tool_call",
+        id: "call-2",
+        name: "bash",
+        arguments: { command: "pwd" },
+      },
+    },
+    {
+      type: "tool_call_end",
+      contentIndex: 0,
+      toolCall: {
+        type: "tool_call",
+        id: "call-1",
+        name: "read",
+        arguments: { path: "README.md" },
+      },
+    },
+    {
+      type: "done",
+      reason: "tool_call",
+      message: {
+        role: "assistant",
+        stopReason: "tool_call",
+        content: [
+          { type: "tool_call", id: "call-1", name: "read", arguments: { path: "README.md" } },
+          { type: "tool_call", id: "call-2", name: "bash", arguments: { command: "pwd" } },
+        ],
+      },
+    },
+  ]);
+});
+
 test("accepts error with safe partial text content", () => {
   acceptTrace([
     { type: "start" },

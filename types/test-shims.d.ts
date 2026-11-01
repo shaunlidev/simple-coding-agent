@@ -1,6 +1,7 @@
 declare module "node:test" {
   type TestBody = () => void | Promise<void>;
   export default function test(name: string, body: TestBody): void;
+  export default function test(name: string, options: { skip?: boolean | string }, body: TestBody): void;
 }
 
 declare module "node:assert/strict" {
@@ -71,6 +72,26 @@ declare module "node:readline" {
     [Symbol.asyncIterator](): AsyncIterator<string>;
     close(): void;
   };
+}
+
+declare module "node:http" {
+  export type ServerResponse = {
+    setHeader(name: string, value: string): void;
+    end(value: string): void;
+  };
+
+  export function createServer(
+    listener: (request: unknown, response: ServerResponse) => void,
+  ): {
+    listen(port: number, host: string, callback: () => void): void;
+    address(): null | string | { port: number };
+    close(callback: () => void): void;
+  };
+}
+
+declare module "*.css" {
+  const value: string;
+  export default value;
 }
 
 declare const Buffer: {

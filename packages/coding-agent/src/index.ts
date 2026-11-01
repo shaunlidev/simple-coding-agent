@@ -59,4 +59,35 @@ export {
   type SessionRecord,
 } from "./session.js";
 
+export {
+  parseTaskCliArgs,
+  runTaskCli,
+  type TaskCliCommand,
+} from "./task-cli.js";
+
+export {
+  createScheduledTask,
+  formatTaskList,
+  listScheduledTasks,
+  readTaskStore,
+  recordTaskFeedback,
+  runDueTasks,
+  runScheduledTask,
+  updatePreferences,
+  writeTaskStore,
+  type AgentTaskEvent,
+  type AgentTaskEventType,
+  type CreateTaskArgs,
+  type FeedbackRecord,
+  type FeedbackSignal,
+  type MemoryProfile,
+  type RawContentItem,
+  type ScheduledTask,
+  type ScoredContentItem,
+  type SourceKind,
+  type TaskRunResult,
+  type TaskRuntimeOptions,
+  type TaskStore,
+} from "./tasks.js";
+
 export const codingAgentPackageReady = true;

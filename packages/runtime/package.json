@@ -1,0 +1,16 @@
+{
+  "name": "@simple-coding-agent/runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@simple-coding-agent/db": "0.1.0",
+    "drizzle-orm": "^0.45.2",
+    "node-cron": "^4.6.0"
+  }
+}

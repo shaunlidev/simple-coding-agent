@@ -313,14 +313,23 @@ function createStreamingAssembler(stream: ReturnType<typeof createAssistantMessa
       if (!tool.started && tool.name) {
         stream.push({ type: "tool_call_start", contentIndex: tool.contentIndex, id: tool.id, name: tool.name });
         tool.started = true;
+        if (tool.argumentsJson) {
+          stream.push({
+            type: "tool_call_delta",
+            contentIndex: tool.contentIndex,
+            argumentsDelta: tool.argumentsJson,
+          });
+        }
       }
       if (toolDelta.function?.arguments) {
         tool.argumentsJson += toolDelta.function.arguments;
-        stream.push({
-          type: "tool_call_delta",
-          contentIndex: tool.contentIndex,
-          argumentsDelta: toolDelta.function.arguments,
-        });
+        if (tool.started) {
+          stream.push({
+            type: "tool_call_delta",
+            contentIndex: tool.contentIndex,
+            argumentsDelta: toolDelta.function.arguments,
+          });
+        }
       }
     }
   }

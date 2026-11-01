@@ -330,6 +330,39 @@ test("interactive TUI workflow commands create specs, plans, and evidence", asyn
   assert.equal(evidence.includes("Manual smoke passed"), true);
 });
 
+test("interactive TUI task commands create tasks, digests, preferences, and feedback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-tasks-"));
+  const { output, io } = createIo();
+  const input = createInput([
+    "/task-create daily-social-brief | 6h | mock | | coding agent",
+    "/preferences AI agent,browser automation | shallow advice",
+    "/tasks",
+    "/task-run daily-social-brief",
+    "/feedback daily-social-brief example.test-browser-social-signals saved",
+    "/quit",
+  ]);
+
+  const code = await runTui(
+    ["--cwd", root],
+    io,
+    () => {
+      throw new Error("runtime should not initialize for task slash commands");
+    },
+    { input },
+  );
+
+  const tasks = JSON.parse(new TextDecoder().decode(await readFile(join(root, "docs/agent/schedules/tasks.json"))));
+  const events = new TextDecoder().decode(await readFile(join(root, "docs/agent/events/queue.jsonl")));
+  const feedback = new TextDecoder().decode(await readFile(join(root, "docs/agent/memory/feedback.jsonl")));
+
+  assert.equal(code, 0);
+  assert.equal(tasks.tasks[0].id, "daily-social-brief");
+  assert.equal(output.stdout.includes("Created task daily-social-brief"), true);
+  assert.equal(output.stdout.includes("Ran daily-social-brief: 3 items"), true);
+  assert.equal(events.includes('"delivery_created"'), true);
+  assert.equal(feedback.includes('"saved"'), true);
+});
+
 test("TUI reports aborted runs distinctly", async () => {
   const { output, io } = createIo();
   const controller = new AbortController();

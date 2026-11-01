@@ -8,6 +8,8 @@ Status:
 - Interactive streaming TUI: available locally after build.
 - Browser tools: available when Playwright is installed locally.
 - Workflow tools: write requirements, backlog, plans, and verification evidence under `docs/agent/`.
+- Scheduled content tasks: local scheduler, event log, memory/preferences, content pipeline, digest delivery, and feedback loop.
+- Agent Ops Dashboard: being rebuilt as a production-shaped Fastify/React/SQLite/Drizzle control plane.
 - npm publishing: not supported yet. This repository is GitHub-only for now.
 
 ## Requirements
@@ -42,6 +44,8 @@ Run static checks that do not need a key:
 ```bash
 npm run agent:help
 npm run tui:help
+npm run task -- --help
+npm run dashboard:build
 ```
 
 Run the CLI with a key in your environment:
@@ -95,6 +99,11 @@ Interactive commands:
 - `/backlog`
 - `/plan [ID]`
 - `/verify ID | passed|failed|blocked | SUMMARY | CMD1; CMD2`
+- `/tasks`
+- `/task-create ID | EVERY | SOURCE | URL | QUERY`
+- `/task-run ID`
+- `/feedback TASK ITEM SIGNAL`
+- `/preferences INTERESTS | BLOCKED`
 
 The TUI renders each turn as readable `You`, `Agent`, `Tools`, and `status` blocks. Assistant text streams as provider deltas arrive; if a provider does not emit deltas, the TUI falls back to printing the final assistant message once.
 
@@ -134,6 +143,95 @@ Available tools:
 - `workflow_create_plan`
 - `workflow_record_verification`
 
+## Scheduled Content Tasks
+
+The task runtime is the first local-first slice of a personalized content agent. It stores all state under `docs/agent`:
+
+- `docs/agent/schedules/tasks.json`
+- `docs/agent/events/queue.jsonl`
+- `docs/agent/events/runs.jsonl`
+- `docs/agent/memory/preferences.json`
+- `docs/agent/memory/feedback.jsonl`
+- `docs/agent/digests/*.md`
+
+Create and run a mock social brief:
+
+```bash
+npm run task -- create daily-social-brief --every 6h --source mock --query "coding agent"
+npm run task -- preferences --interests "AI agent,coding agent,browser automation" --blocked-topics "shallow advice"
+npm run task -- run daily-social-brief
+```
+
+Run due tasks manually or from cron:
+
+```bash
+npm run task -- run-due
+npm run task -- daemon --interval-ms 60000
+```
+
+Record feedback:
+
+```bash
+npm run task -- feedback daily-social-brief ITEM_ID saved
+npm run task -- feedback daily-social-brief ITEM_ID not_interested
+```
+
+Supported first-pass sources are `mock`, `browser`, and `rss`. Browser sources require Playwright and collect visible page text/elements through the same browser adapter used by the agent tools.
+
+## Agent Ops Dashboard
+
+The dashboard is a real Agent Ops control plane for a personalized content agent. It is not a spec or README showcase. The locked production-shaped stack is Fastify, React/Vite, TanStack Query, SQLite, Drizzle ORM, node-cron, SSE, Playwright, and the existing DeepSeek provider.
+
+Initialize the local database:
+
+```bash
+npm run db:migrate
+npm run db:seed
+```
+
+Run the API:
+
+```bash
+npm run build
+npm run server
+```
+
+In another shell, run the dashboard:
+
+```bash
+npm run dashboard
+```
+
+Build a hostable static version:
+
+```bash
+npm run dashboard:build
+```
+
+Default local endpoints:
+
+- API: `http://127.0.0.1:4175`
+- Dashboard dev server: `http://127.0.0.1:5173`
+- Health: `http://127.0.0.1:4175/healthz`
+- Readiness: `http://127.0.0.1:4175/readyz`
+
+The implementation follows `docs/plans/active/0008-agent-ops-dashboard-production.md`. Each phase must define plan, acceptance criteria, implementation, and verification before the next phase starts.
+
+## Docker
+
+Build and run the API plus dashboard preview:
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+- Dashboard: `http://localhost:4176`
+- API: `http://localhost:4175`
+
+Docker health checks call the Fastify `/healthz` endpoint. Runtime state is stored in the `agent-data` Docker volume.
+
 ## Local Safety
 
 - The model can only use tools rooted at `--cwd`, or the current working directory if `--cwd` is omitted.
@@ -141,6 +239,17 @@ Available tools:
 - `bash` runs with a scrubbed environment. API keys, tokens, secrets, passwords, and common cloud credentials are not passed to subprocesses by default.
 - Session JSONL records refuse to serialize the active `DEEPSEEK_API_KEY`.
 - `.env` files are ignored by git. `.env.example` is safe to commit.
+- Agent Ops API responses, SSE snapshots, audit records, and error envelopes redact secret-like values.
+- Browser navigation and URL collection use `AGENT_URL_ALLOWLIST`.
+- High-risk/write tools require approval before execution and denied attempts are written to the SQLite audit trail.
+
+Production secret enforcement:
+
+```bash
+AGENT_REQUIRE_PRODUCTION_SECRETS=1 npm run server
+```
+
+With enforcement enabled, startup fails clearly if `DEEPSEEK_API_KEY` is missing.
 
 ## Testing
 
@@ -150,9 +259,12 @@ Local gates do not require network or a real key:
 npm run check
 npm run build
 npm run check:package-boundaries
+npm run dashboard:build
 npm run test
 npm run eval
 ```
+
+Agent Ops evals and harnesses are tracked in the phase plan. The old `docs/demo` portfolio artifact flow is no longer part of the product direction.
 
 Live DeepSeek smoke tests are opt-in:
 
@@ -161,6 +273,12 @@ DEEPSEEK_API_KEY=your_key_here npm run test:live
 ```
 
 Without `DEEPSEEK_API_KEY`, the live gate skips model calls quickly.
+
+The browser collection scenario is also opt-in:
+
+```bash
+RUN_BROWSER_LIVE=1 npm run test:live
+```
 
 ## Troubleshooting
 

@@ -6,6 +6,7 @@
 npm run check
 npm run build
 npm run check:package-boundaries
+npm run dashboard:build
 npm run test
 npm run eval
 ```
@@ -24,6 +25,14 @@ Live tests are opt-in and should not run in default CI.
 Without `DEEPSEEK_API_KEY`, the live smoke test exits quickly without making a network request.
 With a key, the live gate verifies both plain text completion and a required tool-call path against a temporary fixture file.
 
+## Live Browser Scenario
+
+```bash
+RUN_BROWSER_LIVE=1 npm run test:live
+```
+
+The browser live eval starts a local social-style HTML feed, collects it through the task runtime's browser source, and verifies the generated digest. It is opt-in because it requires Playwright and a local browser install.
+
 ## Test Layers
 
 - Unit tests cover pure logic and protocol contracts.
@@ -33,5 +42,8 @@ With a key, the live gate verifies both plain text completion and a required too
 - Session tests assert JSONL versioning, append/read ordering, replay, and future-version rejection.
 - Browser tool tests use fake adapters so local gates do not require browser installation.
 - Workflow tests assert durable files under `docs/agent/`.
+- Task runtime tests assert scheduler state, event logs, run logs, memory preferences, feedback, ranking, digest delivery, and browser-source collection.
+- Agent Ops runtime tests assert event replay, malformed event rejection, schedule actions, content feedback, guarded memory writes, and security audit behavior.
+- Dashboard evals assert build output, operations cockpit content, API wiring, and absence of `docs/demo` dependencies.
 - TUI tests assert rendered terminal status, streaming text deltas, no final text duplication after streaming, tool events, abort handling, one-shot behavior, interactive multi-turn behavior, slash-command resets, and session records.
 - Evals assert task-level behavior and record prompt, transcript, tool events, final output, and workspace path.

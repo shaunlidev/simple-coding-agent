@@ -1,0 +1,12 @@
+.env
+.git
+data
+docs/demo
+docs/runtime
+node_modules
+packages/*/dist
+packages/dashboard/dist
+*.db
+*.sqlite
+*.jsonl
+agent-ops-dashboard-*.png
