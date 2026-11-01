@@ -7,25 +7,25 @@
     "packages/*"
   ],
   "scripts": {
-    "agent": "node packages/coding-agent/dist/entry.js",
-    "agent:help": "node packages/coding-agent/dist/entry.js --help",
+    "agent": "node --env-file-if-exists=.env packages/coding-agent/dist/entry.js",
+    "agent:help": "node --env-file-if-exists=.env packages/coding-agent/dist/entry.js --help",
     "build": "tsc -b packages/ai packages/agent packages/coding-agent packages/db packages/security packages/runtime packages/server packages/tui",
     "check:package-boundaries": "node scripts/check-package-boundaries.mjs",
     "check": "tsc --noEmit",
     "dashboard": "npm run build && npm run dev --workspace @simple-coding-agent/dashboard",
     "dashboard:build": "npm run build && npm run build --workspace @simple-coding-agent/dashboard",
     "dashboard:preview": "npm run build && npm run preview --workspace @simple-coding-agent/dashboard",
-    "db:migrate": "npm run build && node packages/server/dist/migrate.js",
-    "db:seed": "npm run build && node packages/server/dist/seed.js",
+    "db:migrate": "npm run build && node --env-file-if-exists=.env packages/server/dist/migrate.js",
+    "db:seed": "npm run build && node --env-file-if-exists=.env packages/server/dist/seed.js",
     "test": "node --experimental-transform-types --test \"packages/**/*.test.ts\" \"evals/**/*.eval.ts\"",
     "test:ai": "node --experimental-transform-types --test \"packages/ai/test/*.test.ts\"",
     "eval": "node --experimental-transform-types --test \"evals/*.eval.ts\"",
     "test:live": "node --experimental-transform-types --test \"evals/*.live.eval.ts\"",
-    "server": "node packages/server/dist/entry.js",
+    "server": "node --env-file-if-exists=.env packages/server/dist/entry.js",
     "server:check": "npm run check --workspace @simple-coding-agent/server",
-    "task": "node packages/coding-agent/dist/task-entry.js",
-    "tui": "node packages/tui/dist/entry.js",
-    "tui:help": "node packages/tui/dist/entry.js --help"
+    "task": "node --env-file-if-exists=.env packages/coding-agent/dist/task-entry.js",
+    "tui": "node --env-file-if-exists=.env packages/tui/dist/entry.js",
+    "tui:help": "node --env-file-if-exists=.env packages/tui/dist/entry.js --help"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -37,6 +37,7 @@
     "@vitejs/plugin-react": "^6.1.0",
     "playwright": "^1.62.1",
     "tailwindcss": "^4.3.3",
+    "typescript": "5.9.3",
     "vite": "^8.2.2"
   },
   "dependencies": {

@@ -1,7 +1,9 @@
 import cors from "@fastify/cors";
+import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { RuntimeScheduler, SQLiteRuntimeStore, type MemoryEntryInput, type RuntimeSchedule } from "@simple-coding-agent/runtime";
 import { evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
 import { z } from "zod";
@@ -10,6 +12,7 @@ export type AgentOpsServerOptions = {
   env?: Record<string, string | undefined>;
   logger?: boolean;
   startScheduler?: boolean;
+  dashboardRoot?: string;
 };
 
 const createScheduleSchema = z.object({
@@ -95,6 +98,11 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   });
 
   await app.register(cors, { origin: env.AGENT_CORS_ORIGIN === "*" ? true : env.AGENT_CORS_ORIGIN });
+
+  const dashboardRoot = options.dashboardRoot ?? fileURLToPath(new URL("../../dashboard/dist/", import.meta.url));
+  if (existsSync(dashboardRoot)) {
+    await app.register(fastifyStatic, { root: dashboardRoot, index: "index.html", maxAge: 0 });
+  }
 
   app.get("/healthz", async () => ({ ok: true }));
 

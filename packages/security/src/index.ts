@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const envSchema = z.object({
-  DEEPSEEK_API_KEY: z.string().min(1).optional(),
+  DEEPSEEK_API_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().min(1).optional()),
   DEEPSEEK_MODEL: z.string().min(1).default("deepseek-v4-pro"),
   AGENT_DB_PATH: z.string().min(1).default("data/agent-ops.sqlite"),
   AGENT_SERVER_HOST: z.string().min(1).default("127.0.0.1"),

@@ -9,12 +9,12 @@ Status:
 - Browser tools: available when Playwright is installed locally.
 - Workflow tools: write requirements, backlog, plans, and verification evidence under `docs/agent/`.
 - Scheduled content tasks: local scheduler, event log, memory/preferences, content pipeline, digest delivery, and feedback loop.
-- Agent Ops Dashboard: being rebuilt as a production-shaped Fastify/React/SQLite/Drizzle control plane.
+- Agent Ops Dashboard: Fastify/React/SQLite control plane under acceptance repair. Its current content run is a demo until the real execution gate is completed.
 - npm publishing: not supported yet. This repository is GitHub-only for now.
 
 ## Requirements
 
-- Node.js 22.19 or newer.
+- Node.js 22.23.4 for the verified build path, as pinned in `.nvmrc` and `.node-version`.
 - A DeepSeek API key for real model-backed runs.
 
 ## Quickstart
@@ -22,8 +22,8 @@ Status:
 ```bash
 git clone https://github.com/shaunlidev/simple-coding-agent
 cd simple-coding-agent
-npm install
-cp .env.example .env
+npm ci
+cp -n .env.example .env
 ```
 
 Edit `.env` and set:
@@ -32,6 +32,8 @@ Edit `.env` and set:
 DEEPSEEK_API_KEY=your_key_here
 DEEPSEEK_MODEL=deepseek-v4-pro
 ```
+
+Keep an existing `.env`; the command above does not overwrite it. CLI, TUI, task, database, and server npm commands load the project-root `.env`. Already-exported environment variables take precedence. Test commands do not load it.
 
 Then build:
 
@@ -211,15 +213,17 @@ npm run dashboard:build
 Default local endpoints:
 
 - API: `http://127.0.0.1:4175`
-- Dashboard dev server: `http://127.0.0.1:5173`
+- Dashboard dev server: `http://127.0.0.1:4176`
 - Health: `http://127.0.0.1:4175/healthz`
 - Readiness: `http://127.0.0.1:4175/readyz`
 
-The implementation follows `docs/plans/active/0008-agent-ops-dashboard-production.md`. Each phase must define plan, acceptance criteria, implementation, and verification before the next phase starts.
+After `npm run dashboard:build`, the API also serves the built dashboard at `http://127.0.0.1:4175`. Production UI, API, and SSE share that origin.
+
+The implementation follows `docs/plans/active/0008-agent-ops-dashboard-production.md` and the approved repairs in `0009-agent-ops-acceptance-recovery.md`. Production acceptance is open. Each repair batch requires plan, acceptance criteria, implementation, and verification before the next batch starts.
 
 ## Docker
 
-Build and run the API plus dashboard preview:
+Build and run the API with the built dashboard:
 
 ```bash
 docker compose up --build
@@ -227,10 +231,10 @@ docker compose up --build
 
 Then open:
 
-- Dashboard: `http://localhost:4176`
+- Dashboard: `http://localhost:4175`
 - API: `http://localhost:4175`
 
-Docker health checks call the Fastify `/healthz` endpoint. Runtime state is stored in the `agent-data` Docker volume.
+Docker health checks call the Fastify `/healthz` endpoint. Runtime state is stored in the `agent-data` Docker volume. The compose port binds to localhost during acceptance repair. Set the DeepSeek key in `.env` before starting the production container.
 
 ## Local Safety
 

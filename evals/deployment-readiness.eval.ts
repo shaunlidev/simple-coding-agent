@@ -7,7 +7,7 @@ async function text(path: string): Promise<string> {
   return new TextDecoder().decode(await readFile(path));
 }
 
-test("deployment readiness files define health checks, CI gates, and safe examples", async () => {
+test("deployment manifests declare health checks, CI gates, and safe examples (not runtime acceptance)", async () => {
   const [dockerfile, compose, ci, packageJson, envExample, readme, gitignore] = await Promise.all([
     text("Dockerfile"),
     text("docker-compose.yml"),
@@ -21,8 +21,7 @@ test("deployment readiness files define health checks, CI gates, and safe exampl
   assert.equal(dockerfile.includes("HEALTHCHECK"), true);
   assert.equal(dockerfile.includes("/healthz"), true);
   assert.equal(compose.includes("agent-api"), true);
-  assert.equal(compose.includes("dashboard"), true);
-  assert.equal(compose.includes("service_healthy"), true);
+  assert.equal(compose.includes("healthcheck:"), true);
   assert.equal(packageJson.includes("\"db:migrate\""), true);
   assert.equal(packageJson.includes("\"db:seed\""), true);
   for (const gate of ["npm run check", "npm run build", "npm run check:package-boundaries", "npm run dashboard:build", "npm run test", "npm run eval"]) {

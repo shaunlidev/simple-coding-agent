@@ -1,6 +1,6 @@
 import { appendFile, readFile } from "node:fs/promises";
-import type { AgentEvent } from "../../agent/dist/index.js";
-import type { Message } from "../../ai/dist/index.js";
+import type { AgentEvent } from "@simple-coding-agent/agent";
+import type { Message } from "@simple-coding-agent/ai";
 
 export const SESSION_RECORD_VERSION = 1;
 

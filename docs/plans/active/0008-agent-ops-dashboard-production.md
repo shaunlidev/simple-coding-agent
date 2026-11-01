@@ -1,5 +1,17 @@
 # 0008 Agent Ops Dashboard Production Plan
 
+## Acceptance reopened on 2026-11-01
+
+The review of commit `797ccb8` disproved the earlier overall completion claim. The verification notes below are historical records, not current release approval. Local test success did not prove clean installation, production execution, authorization, or container readiness.
+
+Confirmed gaps include a missing local TypeScript dependency, a failed Docker build, an unauthenticated API, client-asserted approvals, a mock dashboard execution path, fixed usage metrics, unearned passing eval states, missing results after repeated runs, ignored schedule timezones, and ineffective cancellation.
+
+Keep every requirement and the locked stack in this plan. Execute the proposed repair batches in [0009 Agent Ops acceptance recovery](0009-agent-ops-acceptance-recovery.md). That document maps each repair back to the original phases. It explicitly changes the repair order to address build and authorization before connecting production tools. It does not remove original acceptance criteria.
+
+The R1-R10 repair order is proposed for review. Once approved, it governs the order of repair work. Each original phase remains open until all its original acceptance criteria have passing evidence. Preparing the repair documents does not approve implementation or close a phase.
+
+Deployment acceptance requires an actual container build, healthy running services, and an end-to-end browser check. Dockerfile text checks and host-process health checks alone cannot close Phase 10. Keep this plan active until the original criteria and the repair gates have current evidence.
+
 ## Execution Contract
 
 Every phase must follow the same sequence:

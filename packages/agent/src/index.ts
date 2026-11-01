@@ -1,4 +1,4 @@
-import { EventStream, parseToolArguments, ToolArgumentsValidationError } from "../../ai/dist/index.js";
+import { EventStream, parseToolArguments, ToolArgumentsValidationError } from "@simple-coding-agent/ai";
 import type {
   AssistantContent,
   AssistantMessage,
@@ -9,7 +9,7 @@ import type {
   ToolCallContent,
   ToolDefinition,
   ToolMessage,
-} from "../../ai/dist/index.js";
+} from "@simple-coding-agent/ai";
 
 export type AgentEvent =
   | { type: "agent_start"; prompt: string }

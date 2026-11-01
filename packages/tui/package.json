@@ -13,6 +13,8 @@
     "test": "node --experimental-transform-types --test \"test/*.test.ts\""
   },
   "dependencies": {
+    "@simple-coding-agent/ai": "0.1.0",
+    "@simple-coding-agent/agent": "0.1.0",
     "@simple-coding-agent/coding-agent": "0.1.0"
   }
 }

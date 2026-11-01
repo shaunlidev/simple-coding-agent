@@ -5,3 +5,7 @@ packages/*/dist/
 .env
 .env.*
 !.env.example
+data/
+artifacts/
+test-results/
+playwright-report/

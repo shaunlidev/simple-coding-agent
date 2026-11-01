@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EventStream } from "../../ai/dist/event-stream.js";
-import { createFauxProvider } from "../../ai/dist/faux-provider.js";
-import type { AssistantMessage, JsonObject, Provider, StreamEvent, ToolDefinition } from "../../ai/dist/index.js";
+import { EventStream, createFauxProvider } from "@simple-coding-agent/ai";
+import type { AssistantMessage, JsonObject, Provider, StreamEvent, ToolDefinition } from "@simple-coding-agent/ai";
 import { Agent, runAgentLoop } from "../src/index.ts";
 
 type ReadArgs = JsonObject & { path: string };

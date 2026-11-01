@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Agent } from "../packages/agent/src/index.ts";
-import { createDeepSeekProvider } from "../packages/ai/dist/deepseek-provider.js";
+import { createDeepSeekProvider } from "@simple-coding-agent/ai";
 import { createLocalTools } from "../packages/coding-agent/src/tools.ts";
 
 test("live DeepSeek text smoke", async () => {

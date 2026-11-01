@@ -1,5 +1,5 @@
-import type { AgentEvent } from "../../agent/dist/index.js";
-import type { AssistantContent, AssistantMessage, Message } from "../../ai/dist/index.js";
+import type { AgentEvent } from "@simple-coding-agent/agent";
+import type { AssistantContent, AssistantMessage, Message } from "@simple-coding-agent/ai";
 import {
   appendSessionRecord,
   readSessionRecords,
@@ -227,8 +227,8 @@ export async function createDefaultRuntime(command: Extract<CliCommand, { kind: 
   }
 
   const [agentModule, aiModule] = await Promise.all([
-    import("../../agent/dist/index.js"),
-    import("../../ai/dist/index.js"),
+    import("@simple-coding-agent/agent"),
+    import("@simple-coding-agent/ai"),
   ]);
   const { Agent } = agentModule as unknown as { Agent: new (options: Record<string, unknown>) => PromptRunner };
   const { createDeepSeekProvider } = aiModule as unknown as {

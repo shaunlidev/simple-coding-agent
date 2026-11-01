@@ -4,8 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Agent, runAgentLoop, type AgentEvent } from "../packages/agent/src/index.ts";
-import { createFauxProvider, type FauxResponse } from "../packages/ai/dist/faux-provider.js";
-import type { Message } from "../packages/ai/dist/index.js";
+import { createFauxProvider, type FauxResponse, type Message } from "@simple-coding-agent/ai";
 import { createLocalTools } from "../packages/coding-agent/src/tools.ts";
 
 type EvalArtifact = {

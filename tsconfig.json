@@ -9,6 +9,9 @@
     "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "paths": {
+      "@simple-coding-agent/ai": ["packages/ai/src/index.ts"],
+      "@simple-coding-agent/agent": ["packages/agent/src/index.ts"],
+      "@simple-coding-agent/coding-agent": ["packages/coding-agent/src/index.ts"],
       "@simple-coding-agent/db": ["packages/db/src/index.ts"],
       "@simple-coding-agent/runtime": ["packages/runtime/src/index.ts"],
       "@simple-coding-agent/security": ["packages/security/src/index.ts"]

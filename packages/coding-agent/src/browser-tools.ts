@@ -1,4 +1,4 @@
-import type { JsonObject, ToolDefinition } from "../../ai/dist/index.js";
+import type { JsonObject, ToolDefinition } from "@simple-coding-agent/ai";
 
 export type BrowserNavigateArgs = {
   url: string;

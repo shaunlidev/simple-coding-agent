@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import type { ToolDefinition } from "../../ai/dist/index.js";
+import type { ToolDefinition } from "@simple-coding-agent/ai";
 import { createBrowserTools, type BrowserAdapter } from "./browser-tools.js";
 import { createWorkflowTools } from "./workflow.js";
 

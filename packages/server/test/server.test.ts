@@ -1,6 +1,29 @@
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { createAgentOpsServer } from "../src/index.ts";
+
+test("server serves the production dashboard and API from one origin", async () => {
+  const dashboardRoot = await mkdtemp(join(tmpdir(), "agent-dashboard-static-"));
+  await writeFile(join(dashboardRoot, "index.html"), "<!doctype html><title>Agent Ops</title><main id=app></main>");
+  const { app, database } = await createAgentOpsServer({ env: { AGENT_DB_PATH: ":memory:" }, dashboardRoot });
+  try {
+    const html = await app.inject({ method: "GET", url: "/" });
+    const snapshot = await app.inject({ method: "GET", url: "/api/snapshot" });
+    const missingApi = await app.inject({ method: "GET", url: "/api/not-a-route" });
+    assert.equal(html.statusCode, 200);
+    assert.equal(html.headers["content-type"]?.toString().includes("text/html"), true);
+    assert.equal(html.body.includes("Agent Ops"), true);
+    assert.equal(snapshot.statusCode, 200);
+    assert.equal(snapshot.json().agent.name, "Personalized Content Agent");
+    assert.equal(missingApi.statusCode, 404);
+  } finally {
+    await app.close();
+    database.sqlite.close();
+  }
+});
 
 test("server exposes health, readiness, and snapshot endpoints", async () => {
   const { app, database } = await createAgentOpsServer({ env: { AGENT_DB_PATH: ":memory:" } });

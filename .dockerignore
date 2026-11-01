@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .git
 data
 docs/demo
@@ -10,3 +12,6 @@ packages/dashboard/dist
 *.sqlite
 *.jsonl
 agent-ops-dashboard-*.png
+artifacts
+test-results
+playwright-report

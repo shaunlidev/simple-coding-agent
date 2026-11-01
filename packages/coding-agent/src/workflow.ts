@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { ToolDefinition } from "../../ai/dist/index.js";
+import type { ToolDefinition } from "@simple-coding-agent/ai";
 
 export type WorkflowRuntimeOptions = {
   allowedRoot: string;

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Agent } from "../../agent/src/index.ts";
-import { createFauxProvider } from "../../ai/dist/faux-provider.js";
+import { createFauxProvider } from "@simple-coding-agent/ai";
 import { parseCliArgs, runCli } from "../src/cli.ts";
 import { SESSION_RECORD_VERSION } from "../src/session.ts";
 

@@ -1,5 +1,5 @@
-import type { AgentEvent } from "../../agent/dist/index.js";
-import type { AssistantContent, AssistantMessage, Message, StreamEvent } from "../../ai/dist/index.js";
+import type { AgentEvent } from "@simple-coding-agent/agent";
+import type { AssistantContent, AssistantMessage, Message, StreamEvent } from "@simple-coding-agent/ai";
 import {
   appendSessionRecord,
   createDefaultRuntime,
@@ -16,7 +16,7 @@ import {
   workflowListBacklog,
   workflowRecordVerification,
   type CliIo,
-} from "../../coding-agent/dist/index.js";
+} from "@simple-coding-agent/coding-agent";
 
 export type TuiCommand =
   | { kind: "help" }
