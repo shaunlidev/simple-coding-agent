@@ -4,7 +4,13 @@ import { z } from "zod";
 import { SafeNetwork, createRedactor } from "@simple-coding-agent/security";
 import { readBrowserSource } from "./browser-source.js";
 export { readBrowserSource } from "./browser-source.js";
-import { contentEntities, contentIdentityKey, runContentResults, contentDeliveries, runReceipts, runRequests, createSqliteDatabase, evalReports, feedback, memoryEntries, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
+import { contentEntities, contentIdentityKey, runContentResults, contentDeliveries, runReceipts, runRequests, createSqliteDatabase, evalReports, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
+import { RuntimeMemory, adjustContentRank } from "./memory.js";
+import { RuntimePractices } from "./practices.js";
+import { practiceSelection, validatePracticeQuotes } from "./practice-rules.js";
+export { practiceProposalSchema } from "./practices.js";
+export { adjustContentRank } from "./memory.js";
+export type { MemoryContext, FrozenMemoryContext, MemoryHit } from "./memory.js";
 import { parseRuntimeEvent, type RuntimeEvent, type RuntimeEventType } from "./events.js";
 import { contentTaskSchema, contentCitationSchema, sourceReadSchema, type ContentTaskRecord, type ContentCitation, type SourceRead } from "./content-contract.js";
 import { nextRunAt, validateScheduleClock, parseScheduleDate, coalesceDue } from "./schedule-time.js";
@@ -13,6 +19,8 @@ export { RuntimeScheduler, type SchedulerRunResult, type RuntimeSchedulerOptions
 export { contentTaskSchema } from "./content-contract.js";
 export type { ContentTask, ContentTaskRecord } from "./content-contract.js";
 export { executeContentRun, type ContentProviderFactory } from "./content-agent.js";
+export { createContentExecutor } from "./content-executor.js";
+export { openLocalTaskHost, type LocalTaskHost, type LocalTaskHostOptions } from "./local-host.js";
 export type { RuntimeEvent, RuntimeEventType } from "./events.js";
 
 export type RunStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "skipped";
@@ -389,6 +397,8 @@ export class SQLiteRuntimeStore {
   readonly database: SqliteDatabase;
   readonly redactor: ReturnType<typeof createRedactor>;
   readonly network: SafeNetwork;
+  readonly memory: RuntimeMemory;
+  readonly practices: RuntimePractices;
 
   constructor(options: SQLiteRuntimeStoreOptions = {}) {
     this.redactor = createRedactor(options.secrets);
@@ -396,6 +406,8 @@ export class SQLiteRuntimeStore {
     this.database = options.database ?? createSqliteDatabase(options.path ?? ":memory:");
     try { migrateSqliteDatabase(this.database); }
     catch (error) { if (!options.database) this.database.sqlite.close(); throw error; }
+    this.memory = new RuntimeMemory(this);
+    this.practices = new RuntimePractices(this);
   }
 
   async appendEvent(input: unknown): Promise<RuntimeEvent> {
@@ -448,6 +460,11 @@ export class SQLiteRuntimeStore {
   assertRunExecutable(runId: string): void {
     const value = this.database.sqlite.prepare("select state from scheduled_jobs where run_id = ?").get(runId);
     if (value && !["queued", "running"].includes(z.object({ state: z.string() }).parse(value).state)) throw conflict("Run is cancelled, cancelling or terminal");
+    this.assertMemoryCurrent(runId);
+  }
+
+  assertMemoryCurrent(runId: string): void {
+    if (this.database.sqlite.prepare("select 1 from run_memory_contexts c join memory_state s on s.id=1 where c.run_id=? and c.epoch<>s.epoch").get(runId)) throw conflict("Run memory was cleared; start a new run");
   }
 
   createEvent(runId: string, type: RuntimeEventType, payload: Record<string, unknown>, options: { source?: string; severity?: Severity } = {}): RuntimeEvent {
@@ -490,7 +507,7 @@ export class SQLiteRuntimeStore {
     return this.database.sqlite.transaction(() => {
       const events = this.readEvents(runId);
       if (events.length === 0) return undefined;
-      return { run: projectRun(runId, events), result: this.readRunResult(runId) ?? null, events, task: this.readRunTask(runId) ?? null, sources: this.readSourceResults(runId) };
+      return { run: projectRun(runId, events), result: this.readRunResult(runId) ?? null, events, task: this.readRunTask(runId) ?? null, sources: this.readSourceResults(runId), memoryContext: this.memory.readContext(runId) ?? null };
     })();
   }
 
@@ -538,6 +555,10 @@ export class SQLiteRuntimeStore {
   }
 
   async createSchedule(schedule: RuntimeSchedule): Promise<RuntimeSchedule> {
+    return this.createScheduleSync(schedule);
+  }
+
+  createScheduleSync(schedule: RuntimeSchedule): RuntimeSchedule {
     validateScheduleClock(schedule);
     if (schedule.nextRunAt) parseScheduleDate(schedule.nextRunAt);
     this.redactor.identifier(schedule.id);
@@ -591,124 +612,28 @@ export class SQLiteRuntimeStore {
     }).immediate();
   }
 
-  async writeMemoryEntry(input: MemoryEntryInput): Promise<{ id: string; createdAt: string }> {
-    guardMemoryWrite(input);
-    input = { ...input, content: this.redactor.text(input.content), metadata: this.redactor.record(input.metadata ?? {}) };
-    const id = `mem-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
-    const createdAt = new Date().toISOString();
-    const metadataJson = JSON.stringify(input.metadata ?? {});
-    await this.database.db.insert(memoryEntries).values({
-      id,
-      kind: input.kind,
-      sourceTrust: input.sourceTrust,
-      content: input.content,
-      metadataJson,
-      createdAt,
-    });
-    this.database.sqlite.prepare("insert into memory_fts (id, kind, content, metadata_json) values (?, ?, ?, ?)").run(id, input.kind, input.content, metadataJson);
-    await this.appendEvent(this.createEvent(`memory-${Date.now().toString(36)}`, "memory.preference.updated", {
-      kind: input.kind,
-      detail: `Memory ${input.kind} saved`,
-    }, { source: "memory" }));
-    return { id, createdAt };
+  async writeMemoryEntry(input: MemoryEntryInput, actor = "local"): Promise<{ id: string; createdAt: string }> {
+    return this.memory.write(input, actor);
   }
 
-  async recordFeedback(itemId: string, signal: MemoryState["recentFeedback"][number]["signal"]): Promise<void> {
-    this.redactor.identifier(itemId);
-    const createdAt = new Date().toISOString();
-    await this.database.db.insert(feedback).values({
-      id: `fb-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
-      itemId,
-      signal,
-      createdAt,
-    });
-    await this.appendEvent(this.createEvent(`feedback-${Date.now().toString(36)}`, "memory.preference.updated", {
-      itemId,
-      signal,
-      detail: `Feedback recorded: ${signal}`,
-    }, { source: "memory" }));
+  async recordFeedback(itemId: string, signal: MemoryState["recentFeedback"][number]["signal"], actor = "local", requestKey?: string) {
+    return this.memory.recordFeedback(itemId, signal, actor, requestKey);
   }
 
   async readMemory(): Promise<MemoryState> {
-    const base = defaultMemory();
-    const rows = await this.database.db.select().from(memoryEntries).orderBy(asc(memoryEntries.createdAt));
-    const feedbackRows = await this.database.db.select().from(feedback).orderBy(asc(feedback.createdAt));
-    const interests = new Set(base.interests);
-    const blockedTopics = new Set(base.blockedTopics);
-    const sourceWeights = { ...base.sourceWeights };
-    const recentLessons = [...base.recentLessons];
-    const preferenceDiffs: MemoryState["preferenceDiffs"] = [];
-    for (const row of rows) {
-      const metadata = JSON.parse(row.metadataJson) as Record<string, unknown>;
-      if (row.kind === "preference") {
-        interests.add(row.content);
-        preferenceDiffs.push({ field: "interests", key: row.content, after: row.content, timestamp: row.createdAt });
-      } else if (row.kind === "blocked_topic") {
-        blockedTopics.add(row.content);
-        preferenceDiffs.push({ field: "blockedTopics", key: row.content, after: row.content, timestamp: row.createdAt });
-      } else if (row.kind === "source_weight") {
-        const before = sourceWeights[row.content] ?? 1;
-        const after = Number(metadata.weight ?? before);
-        sourceWeights[row.content] = after;
-        preferenceDiffs.push({ field: "sourceWeights", key: row.content, before, after, timestamp: row.createdAt });
-      } else if (row.kind === "lesson") {
-        recentLessons.unshift({
-          title: String(metadata.title ?? row.content),
-          principle: row.content,
-          evidence: String(metadata.evidence ?? "memory entry"),
-          timestamp: row.createdAt,
-        });
-      }
-    }
-    for (const row of feedbackRows) {
-      const adjustment = row.signal === "saved" ? 0.2 : row.signal === "clicked" ? 0.1 : row.signal === "not_interested" ? -0.3 : -0.1;
-      const key = `feedback:${row.itemId}`;
-      sourceWeights[key] = Number(((sourceWeights[key] ?? 1) + adjustment).toFixed(2));
-      preferenceDiffs.push({ field: "sourceWeights", key, before: Number(((sourceWeights[key] ?? 1) - adjustment).toFixed(2)), after: sourceWeights[key], timestamp: row.createdAt });
-    }
-    return {
-      interests: [...interests],
-      blockedTopics: [...blockedTopics],
-      sourceWeights,
-      recentFeedback: [
-        ...feedbackRows.slice(-20).reverse().map((row) => ({
-          itemId: row.itemId,
-          signal: row.signal as MemoryState["recentFeedback"][number]["signal"],
-          timestamp: row.createdAt,
-        })),
-        ...base.recentFeedback,
-      ].slice(0, 20),
-      recentLessons: recentLessons.slice(0, 20),
-      preferenceDiffs: preferenceDiffs.slice(-20).reverse(),
-    };
+    return this.memory.read();
   }
 
-  async exportMemory(): Promise<MemoryExport> {
-    const rows = await this.database.db.select().from(memoryEntries).orderBy(asc(memoryEntries.createdAt));
-    return {
-      memory: await this.readMemory(),
-      entries: rows.map((row) => ({
-        id: row.id,
-        kind: row.kind,
-        sourceTrust: row.sourceTrust,
-        content: row.content,
-        metadata: JSON.parse(row.metadataJson) as Record<string, unknown>,
-        createdAt: row.createdAt,
-      })),
-    };
+  async exportMemory() {
+    return { ...this.memory.export(), feedback: this.memory.feedback(), practices: this.practices.list(), historyPolicy: "Historical run inputs, practice releases and audit are retained; clear only removes future influence" };
   }
 
-  async clearMemory(): Promise<void> {
-    this.database.sqlite.exec("delete from memory_entries; delete from feedback; delete from memory_fts");
-    await this.appendEvent(this.createEvent(`memory-${Date.now().toString(36)}`, "memory.preference.updated", {
-      action: "cleared",
-      detail: "Memory entries and feedback cleared",
-    }, { source: "memory" }));
+  async clearMemory(actor = "local"): Promise<void> {
+    this.memory.clear(actor);
   }
 
-  async searchMemory(query: string): Promise<Array<{ id: string; kind: string; content: string; metadata: Record<string, unknown> }>> {
-    const rows = this.database.sqlite.prepare("select id, kind, content, metadata_json from memory_fts where memory_fts match ? limit 10").all(query) as Array<{ id: string; kind: string; content: string; metadata_json: string }>;
-    return rows.map((row) => ({ id: row.id, kind: row.kind, content: row.content, metadata: JSON.parse(row.metadata_json) as Record<string, unknown> }));
+  async searchMemory(query: string) {
+    return this.memory.search(query);
   }
 
   async saveEvalReport(report: EvalReportInput): Promise<EvalGate> {
@@ -850,7 +775,10 @@ export class SQLiteRuntimeStore {
       const task = this.listContentTasks().find((candidate) => candidate.definition.id === input.taskId);
       if (!task) throw Object.assign(new Error("Configured content task not found"), { statusCode: 404 });
       const admission = this.admitRun({ actor: input.actor, key: input.key, intent: { taskId: input.taskId, title: task.definition.title, trigger: input.trigger, requestTarget: input.requestTarget } });
-      if (admission.created) this.database.sqlite.prepare("insert into run_task_snapshots values (?, ?, ?)").run(admission.runId, task.revision, JSON.stringify(task.definition));
+      if (admission.created) {
+        this.database.sqlite.prepare("insert into run_task_snapshots values (?, ?, ?)").run(admission.runId, task.revision, JSON.stringify(task.definition));
+        this.memory.capture(admission.runId, task.definition.instruction);
+      }
       return admission;
     }).immediate();
   }
@@ -944,6 +872,10 @@ export class SQLiteRuntimeStore {
         }
       }
       const scope = payload.trigger === "demo" || payload.mode === "demo" ? "demo" : "workspace";
+      const practice = this.memory.readContext(runId)?.context.practice;
+      if (practice) {
+        validatePracticeQuotes(items.map((item) => ({ citations: item.citations ?? [] })), practice.rules);
+      }
       const createdAt = new Date().toISOString();
       const deliveryIds: string[] = [];
       const delivered: DeliveredContentItem[] = [];
@@ -955,9 +887,10 @@ export class SQLiteRuntimeStore {
         const id = this.contentId(item);
         this.database.db.insert(contentEntities).values({ id, identityKey, createdAt }).onConflictDoNothing({ target: contentEntities.identityKey }).run();
         const previousDelivery = this.database.db.select().from(contentDeliveries).where(and(eq(contentDeliveries.scope, scope), eq(contentDeliveries.channel, "inbox"), eq(contentDeliveries.contentId, id))).get();
-        const status: DeliveredContentItem["status"] = item.status === "filtered" || item.status === "failed" ? item.status : previousDelivery ? "already_delivered" : delivered.length >= maxItems ? "filtered" : "delivered";
-        const result = { ...item, id, status };
-        this.database.db.insert(runContentResults).values({ ...result, evidenceJson: JSON.stringify(item.evidence), citationsJson: JSON.stringify(item.citations ?? []), position }).run();
+        const capped = !previousDelivery && practice !== undefined && practice !== null && practiceSelection([...delivered, item], practice.rules).at(-1) === false;
+        const status: DeliveredContentItem["status"] = item.status === "filtered" || item.status === "failed" ? item.status : previousDelivery ? "already_delivered" : capped || delivered.length >= maxItems ? "filtered" : "delivered";
+        const result = { ...item, id, status, evidence: [...item.evidence, ...(capped ? [`practice ${practice?.id}: source delivery cap`] : [])] };
+        this.database.db.insert(runContentResults).values({ ...result, evidenceJson: JSON.stringify(result.evidence), citationsJson: JSON.stringify(item.citations ?? []), position }).run();
         if (status === "delivered") {
           const deliveryId = randomUUID();
           this.database.db.insert(contentDeliveries).values({ id: deliveryId, runId, contentId: id, scope, channel: "inbox", provenance: scope === "demo" ? "demo" : "runtime", createdAt }).run();
@@ -1117,16 +1050,6 @@ function projectPipeline(events: RuntimeEvent[], items: DeliveredContentItem[]):
   };
 }
 
-function guardMemoryWrite(input: MemoryEntryInput): void {
-  if (input.sourceTrust === "external") {
-    throw new Error("Memory write denied: external sources cannot directly write long-term memory");
-  }
-  if (/(ignore previous|system prompt|developer message|exfiltrate|jailbreak|write this to memory)/i.test(input.content)) {
-    throw new Error("Memory write denied: injection-like content rejected");
-  }
-  if (!input.content.trim()) throw new Error("Memory write denied: content is required");
-}
-
 function contentHash(value: string): number {
   let result = 0;
   for (const char of value) result = (result * 31 + char.charCodeAt(0)) | 0;
@@ -1173,40 +1096,9 @@ function summarizeContent(item: RawContentItem): string {
   return text.length <= 240 ? text : `${text.slice(0, 237).trim()}...`;
 }
 
-function rankContent(item: RawContentItem, memory: MemoryState, id = stableContentId(item)): DeliveredContentItem {
-  const text = `${item.title} ${item.text}`.toLowerCase();
-  const evidence: string[] = [];
-  let score = 50;
-  for (const interest of memory.interests) {
-    if (text.includes(interest.toLowerCase())) {
-      score += 14;
-      evidence.push(`matches interest: ${interest}`);
-    }
-  }
-  for (const topic of memory.blockedTopics) {
-    if (text.includes(topic.toLowerCase())) {
-      score -= 35;
-      evidence.push(`blocked topic: ${topic}`);
-    }
-  }
-  const weight = memory.sourceWeights[item.source] ?? 1;
-  score += Math.round(weight * 10);
-  evidence.push(`source weight: ${weight}`);
-  for (const signal of memory.recentFeedback.filter((entry) => entry.itemId === id)) {
-    if (signal.signal === "clicked") {
-      score += 8;
-      evidence.push("feedback: clicked");
-    } else if (signal.signal === "saved") {
-      score += 18;
-      evidence.push("feedback: saved");
-    } else if (signal.signal === "not_interested") {
-      score -= 45;
-      evidence.push("feedback: not interested");
-    } else {
-      score -= 12;
-      evidence.push("feedback: dismissed");
-    }
-  }
+function rankContent(item: RawContentItem, memory: Parameters<typeof adjustContentRank>[1], id = stableContentId(item)): DeliveredContentItem {
+  const ranking = adjustContentRank({ ...item, id, score: 50 }, memory);
+  const evidence = ranking.adjustments.map((adjustment) => adjustment.reason);
   if (item.url) evidence.push(`canonical url: ${item.url}`);
   if (item.text.includes("Merged similar item:")) evidence.push("merged similar content");
   return {
@@ -1217,7 +1109,7 @@ function rankContent(item: RawContentItem, memory: MemoryState, id = stableConte
     ...(item.url ? { url: item.url } : {}),
     summary: summarizeContent(item),
     reason: evidence[0] ?? "ranked by baseline quality",
-    score,
+    score: ranking.score,
     status: "delivered",
     evidence,
     createdAt: new Date().toISOString(),
@@ -1328,7 +1220,7 @@ export async function runContentPipeline(store: SQLiteRuntimeStore, runId: strin
   await emit("pipeline.clean.completed", { count: cleaned.length, durationMs: 90, detail: "Normalized titles, text, and URLs" });
   const unique = dedupeContent(cleaned);
   await emit("pipeline.dedupe.completed", { count: unique.length, removed: cleaned.length - unique.length, durationMs: 70, detail: "Canonical URL and similarity dedupe" });
-  const memory = await store.readMemory();
+  const memory = { profile: await store.readMemory(), feedback: store.memory.feedback() };
   const ranked = unique.map((item) => rankContent(item, memory, store.contentId(item))).sort((left, right) => right.score - left.score);
   await emit("pipeline.rank.completed", { count: ranked.length, durationMs: 140, detail: "Preference and evidence weighted ranking" });
   const estimatedLlm = { durationMs: 860, inputTokens: 2380, outputTokens: 640, costUsd: 0.0029, model: "deepseek-compatible" };
@@ -1369,31 +1261,6 @@ function defaultSchedules(now: string): RuntimeSchedule[] {
       overlapPolicy: "skip",
     },
   ];
-}
-
-function defaultMemory(): MemoryState {
-  return {
-    interests: ["AI agent infrastructure", "coding agents", "scheduler runtime", "agent observability"],
-    blockedTopics: ["generic productivity advice"],
-    sourceWeights: {
-      "technical blogs": 1.4,
-      "social posts": 1.1,
-      "low-signal reposts": 0.4,
-    },
-    recentFeedback: [
-      { itemId: "agent-runtime-events", signal: "saved", timestamp: "2026-08-25T09:30:00.000Z" },
-      { itemId: "generic-productivity", signal: "not_interested", timestamp: "2026-08-25T09:32:00.000Z" },
-    ],
-    recentLessons: [
-      {
-        title: "Dashboard must be sourced from runtime data",
-        principle: "Do not ship spec-shaped UI when the product claim is operational control.",
-        evidence: "User rejected static spec/artifact dashboard.",
-        timestamp: "2026-08-25T09:40:00.000Z",
-      },
-    ],
-    preferenceDiffs: [],
-  };
 }
 
 function defaultEvals(): EvalGate[] {

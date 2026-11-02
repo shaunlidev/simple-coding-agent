@@ -147,14 +147,17 @@ Available tools:
 
 ## Scheduled Content Tasks
 
-The task runtime is the first local-first slice of a personalized content agent. It stores all state under `docs/agent`:
+CLI/TUI task commands share the Dashboard's SQLite state, guarded content executor,
+memory and durable scheduler. `--cwd` resolves `AGENT_DB_PATH` (default
+`data/agent-ops.sqlite`) against that workspace. Use the same absolute database
+path when starting the API from another directory. Digests are per-run Markdown
+exports under `data/exports/digests`, not another state store.
 
-- `docs/agent/schedules/tasks.json`
-- `docs/agent/events/queue.jsonl`
-- `docs/agent/events/runs.jsonl`
-- `docs/agent/memory/preferences.json`
-- `docs/agent/memory/feedback.jsonl`
-- `docs/agent/digests/*.md`
+Configure `AGENT_AUTH_USERS` as described below, then set `AGENT_LOCAL_USER` and
+`AGENT_LOCAL_SECRET` to one of those identities in the local environment or `.env`.
+Do not put secrets in CLI flags. Viewer identities can read; operator identities
+can create/run tasks and change shared preferences. Local database filesystem
+access remains a trusted-host capability, not a multi-user sandbox.
 
 Create and run a mock social brief:
 
@@ -178,7 +181,26 @@ npm run task -- feedback daily-social-brief ITEM_ID saved
 npm run task -- feedback daily-social-brief ITEM_ID not_interested
 ```
 
-Supported first-pass sources are `mock`, `browser`, and `rss`. Browser sources require Playwright and collect visible page text/elements through the same browser adapter used by the agent tools.
+The source must be explicit: `mock` is labeled demo-only and disabled in
+production; `browser`, `rss` and `url` use the real Agent loop and require
+DeepSeek plus the shared URL allowlist. Browser collection is read-only and uses
+the runtime's guarded Chromium transport, not the unrestricted local coding tools.
+Use canonical item IDs printed in the digest for feedback. Repeating the same
+signal does not stack; replacing it updates the next run's frozen input.
+`preferences --interests ""` clears interests; preferences without flags reads
+the current profile. No default interests are silently restored.
+
+Only one worker can execute against a workspace. When the API worker is running,
+terminal list/preferences commands still work but terminal run/daemon reports an
+ownership conflict; run the task through the Dashboard or stop the API first.
+Tasks without `--every` are manual-only. The daemon holds ownership between polls
+and drains on SIGINT/SIGTERM.
+
+For old task files, run `npm run task -- import-legacy`. This explicit, idempotent
+import preserves `docs/agent` originals and records a manifest/ID mapping. Imported
+schedules start paused. Old feedback and run/digest history remain in those files
+and are not fabricated into trusted runtime evidence. A changed manifest or
+conflicting existing state stops the import. Workflow documents remain unchanged.
 
 ## Agent Ops Dashboard
 

@@ -27,8 +27,8 @@ The existing dashboard and deployment checks inspect build output and file text.
 | Historical secrets | New writes/outputs are redacted; existing databases are not retroactively scrubbed | R3 migration / R10 release |
 | Legacy history completeness | R3 retains surviving rows and explicitly marks old receipts incomplete; previously discarded results cannot be recovered from count-only events | R3 evidence; R10 backup/release |
 | Real dashboard agent | R4 controlled UI/browser and actual DeepSeek/public-source gates passed at exact pushed SHA `1a5d677` | R4/R5 checkpoint evidence |
-| Schedule semantics | R5 timezone, durable queue, actual cancellation and real process restart/UI gates pass; exact-commit checkpoint pending | R5 evidence |
-| Memory and practices | FTS storage exists, but use in model context and practice activation need verification | R6 |
+| Schedule semantics | R5 timezone, durable queue, actual cancellation and process/UI gates pass at pushed SHA `6b99dfd` | R5/R6 evidence |
+| Memory and practices | R6 frozen model context, feedback ranking, actual preference history, reviewed practice activation/rollback, shared terminal state and UI/process gates pass; exact-commit checkpoint pending | R6 evidence |
 | Honest telemetry | Real content events now contain actual usage; legacy demo metrics/default eval and security projections still require replacement | R7, R9 |
 | User workflows | UI lacks the complete configuration, feedback, and inspection flows | R8 |
 | Release evidence | Browser, cloud, restart, backup, restore, and rollback gates remain unverified | R9, R10 |
@@ -38,6 +38,12 @@ Record new regression coverage against behavior. A missing or skipped measuremen
 R3's normalized results, unique inbox ledger, request idempotency and transactional terminal events pass repeat/concurrent/restart/rollback checks. Actual process-restart and desktop/mobile history verification passed. R4's real executor extends that transaction with current-run citation checks and frozen task/source evidence. The first live attempt correctly failed on fake-IP DNS; the subsequent explicitly configured trusted-DNS run passed with actual provider usage. R5 preserves frozen queued work, fails interrupted attempts and prevents cancelled delivery. A process-held SQLite lock is tested on local storage, not on network/distributed storage. Legacy bytes in existing databases/backups are not retroactively scrubbed.
 
 The default suite still reports two keyless DeepSeek tests as passed because those tests return early. They are NOT live model evidence; explicit skip reporting is required in R9. Existing bundle-word and deployment-file checks remain only static evidence, alongside the new actual R1/R2 browser/container gates.
+
+R6 clear removes live entries, feedback, preference history and active practice
+influence, but preserves historical run inputs, immutable practice evidence and
+audit. This is not secure erasure or per-user private memory. Practices are typed,
+bounded application rules, not arbitrary model-written system instructions.
+Their deterministic regression gate is not a live-model quality measurement.
 
 ## Rule
 

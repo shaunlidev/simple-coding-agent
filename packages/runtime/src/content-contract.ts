@@ -6,9 +6,11 @@ export const sourceUrlSchema = z.url().max(2048).refine((value) => {
   return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password;
 }, "Source URL must be HTTP(S) without credentials");
 export const remoteSourceSchema = z.object({ id, kind: z.enum(["rss", "url", "browser"]), url: sourceUrlSchema }).strict();
+export const demoSourceSchema = z.object({ id, kind: z.literal("mock"), url: z.literal("https://example.test/demo"), query: z.string().trim().min(1).max(500).default("AI agent") }).strict();
 export const contentTaskSchema = z.object({
   id, title: z.string().trim().min(1).max(160), instruction: z.string().trim().min(1).max(2000),
-  sources: z.array(remoteSourceSchema).min(1).max(4).refine((sources) => new Set(sources.map((source) => source.id)).size === sources.length, "Source IDs must be unique"),
+  mode: z.enum(["live", "demo"]).default("live"),
+  sources: z.array(z.union([remoteSourceSchema, demoSourceSchema])).min(1).max(4).refine((sources) => new Set(sources.map((source) => source.id)).size === sources.length, "Source IDs must be unique"),
   preferenceRef: z.literal("workspace").default("workspace"),
   model: z.string().regex(/^[a-zA-Z0-9._-]{1,80}$/).default("deepseek-v4-pro"),
   limits: z.object({
@@ -21,7 +23,8 @@ export const contentTaskSchema = z.object({
     maxTextChars: z.number().int().min(100).max(6000).default(4000),
     maxDeliveries: z.number().int().min(1).max(10).default(5),
   }).strict().prefault({}),
-}).strict().refine((task) => task.limits.maxToolCalls >= task.sources.length, "Tool budget must permit all configured sources");
+}).strict().refine((task) => task.limits.maxToolCalls >= task.sources.length, "Tool budget must permit all configured sources")
+  .refine((task) => task.mode === "demo" ? task.model === "demo-faux" && task.sources.every((source) => source.kind === "mock") : task.sources.every((source) => source.kind !== "mock"), "Demo tasks require demo-faux and only mock sources; live tasks cannot contain mock sources");
 export type ContentTask = z.infer<typeof contentTaskSchema>;
 export type RemoteSource = z.infer<typeof remoteSourceSchema>;
 export type ContentTaskRecord = { definition: ContentTask; revision: number; updatedAt: string };
@@ -30,7 +33,7 @@ export const observedDocumentSchema = z.object({
   id: z.string().uuid(), runId: z.string().min(1), sourceId: id,
   title: z.string().min(1).max(500), url: sourceUrlSchema, readUrl: sourceUrlSchema,
   text: z.string().min(1).max(6000), hash: z.string().regex(/^[a-f0-9]{64}$/),
-  collectedAt: z.iso.datetime(), truncated: z.boolean(), representation: z.enum(["feed_entry", "page_text"]),
+  collectedAt: z.iso.datetime(), truncated: z.boolean(), representation: z.enum(["feed_entry", "page_text", "demo_fixture"]),
 }).strict();
 export type ObservedDocument = z.infer<typeof observedDocumentSchema>;
 export const sourceReadSchema = z.discriminatedUnion("status", [

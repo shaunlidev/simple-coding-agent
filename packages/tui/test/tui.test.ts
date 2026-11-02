@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parseTuiArgs, runTui, type TuiInput } from "../src/index.ts";
+import { openLocalTaskHost } from "@simple-coding-agent/runtime";
+import { localEnv } from "../../coding-agent/test/task-fixture.ts";
 
 function createIo(): { output: { stdout: string; stderr: string }; io: { stdout: { write(chunk: string): void }; stderr: { write(chunk: string): void } } } {
   const output = { stdout: "", stderr: "" };
@@ -330,15 +332,15 @@ test("interactive TUI workflow commands create specs, plans, and evidence", asyn
   assert.equal(evidence.includes("Manual smoke passed"), true);
 });
 
-test("interactive TUI task commands create tasks, digests, preferences, and feedback", async () => {
+test("interactive TUI task commands share SQLite tasks, digests, preferences, and feedback", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-tasks-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
   const { output, io } = createIo();
   const input = createInput([
     "/task-create daily-social-brief | 6h | mock | | coding agent",
     "/preferences AI agent,browser automation | shallow advice",
     "/tasks",
     "/task-run daily-social-brief",
-    "/feedback daily-social-brief example.test-browser-social-signals saved",
     "/quit",
   ]);
 
@@ -348,19 +350,25 @@ test("interactive TUI task commands create tasks, digests, preferences, and feed
     () => {
       throw new Error("runtime should not initialize for task slash commands");
     },
-    { input },
+    { input, taskEnvironment: localEnv },
   );
 
-  const tasks = JSON.parse(new TextDecoder().decode(await readFile(join(root, "docs/agent/schedules/tasks.json"))));
-  const events = new TextDecoder().decode(await readFile(join(root, "docs/agent/events/queue.jsonl")));
-  const feedback = new TextDecoder().decode(await readFile(join(root, "docs/agent/memory/feedback.jsonl")));
-
-  assert.equal(code, 0);
-  assert.equal(tasks.tasks[0].id, "daily-social-brief");
-  assert.equal(output.stdout.includes("Created task daily-social-brief"), true);
-  assert.equal(output.stdout.includes("Ran daily-social-brief: 3 items"), true);
-  assert.equal(events.includes('"delivery_created"'), true);
-  assert.equal(feedback.includes('"saved"'), true);
+  const host = openLocalTaskHost({ workspaceRoot: root, env: localEnv });
+  try {
+    assert.equal(code, 0, output.stderr);
+    assert.equal(host.store.listContentTasks()[0].definition.id, "daily-social-brief");
+    assert.match(output.stdout, /Created task daily-social-brief/);
+    assert.match(output.stdout, /Ran daily-social-brief: 3 items/);
+    const run = (await host.store.listRuns())[0];
+    const item = host.store.readRunResult(run.id)!.items[0];
+    assert.ok(host.store.readRunDetail(run.id)?.events.some((event) => event.type === "delivery.created"));
+    const feedbackCode = await runTui(["--cwd", root], io, () => { throw new Error("No coding model needed"); }, {
+      input: createInput([`/feedback daily-social-brief ${item.id} saved`, "/quit"]), taskEnvironment: localEnv,
+    });
+    assert.equal(feedbackCode, 0, output.stderr);
+    assert.equal(host.store.memory.feedback()[0].signal, "saved");
+    assert.deepEqual(host.store.memory.read().interests, ["AI agent", "browser automation"]);
+  } finally { await host.close(); }
 });
 
 test("TUI reports aborted runs distinctly", async () => {

@@ -31,6 +31,7 @@ const payloadSchemas = {
   "delivery.created": z.object({ ...measured, count: count.positive(), digest: z.string(), deliveryIds: z.array(z.string()).optional() }).catchall(z.json()),
   "delivery.skipped": z.object({ ...measured, count: z.literal(0), reason: z.literal("no_new_items"), digest: z.literal("") }).catchall(z.json()),
   "memory.preference.updated": note,
+  "memory.practice.changed": note.extend({ action: z.enum(["proposed", "reviewed", "evaluated", "activate", "rollback", "clear"]) }),
   "eval.completed": note,
   "security.policy.checked": note,
   "security.policy.denied": z.object({ ...measured, reason: z.string().min(1) }).catchall(z.json()),

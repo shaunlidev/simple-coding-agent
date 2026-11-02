@@ -5,6 +5,8 @@ import { fetchRun, fetchRuns, fetchSnapshot, patchSchedule, runNow, type Deliver
 import { fetchTasks, cancelRun, runSchedule } from "./api.js";
 import { TaskConfig } from "./TaskConfig.js";
 import { ScheduleConfig } from "./ScheduleConfig.js";
+import { FeedbackControls } from "./FeedbackControls.js";
+import { MemoryWorkbench } from "./MemoryWorkbench.js";
 
 const snapshotKey = ["runtime-snapshot"] as const;
 
@@ -157,7 +159,7 @@ function TraceTable(props: { spans: RuntimeSpan[] }) {
   );
 }
 
-function ContentPipeline(props: { snapshot: RuntimeSnapshot }) {
+function ContentPipeline(props: { snapshot: RuntimeSnapshot; canOperate: boolean }) {
   const pipeline = props.snapshot.pipeline;
   return (
     <div>
@@ -167,7 +169,7 @@ function ContentPipeline(props: { snapshot: RuntimeSnapshot }) {
         <MetricTile label="Delivered" value={formatNumber(pipeline.delivered)} detail={`${pipeline.failedSources.length} failed sources`} tone={pipeline.failedSources.length > 0 ? "warn" : "ok"} />
       </div>
       <div className="contentList">
-        {props.snapshot.contentItems.map((item) => <ContentItem item={item} key={item.id} />)}
+        {props.snapshot.contentItems.map((item) => <ContentItem item={item} key={item.id} canOperate={props.canOperate} />)}
       </div>
       {pipeline.outcome === "no_new_items" ? <p role="status">No new items. Nothing new was added to the inbox.</p> : null}
       {pipeline.outcome === "legacy_incomplete" ? <p role="status">Legacy results may be incomplete.</p> : null}
@@ -176,10 +178,10 @@ function ContentPipeline(props: { snapshot: RuntimeSnapshot }) {
   );
 }
 
-function ContentItem(props: { item: DeliveredContentItem }) {
+function ContentItem(props: { item: DeliveredContentItem; canOperate: boolean }) {
   const sourceUrl = props.item.url && /^https?:\/\//i.test(props.item.url) ? props.item.url : undefined;
   return (
-    <article className="contentItem">
+    <article className="contentItem" aria-label={props.item.title}>
       <div className="contentItemHeader">
         <strong>{sourceUrl ? <a href={sourceUrl} target="_blank" rel="noopener noreferrer">{props.item.title}</a> : props.item.title}</strong>
         <span className={`statusPill ${statusClass(props.item.status)}`}>{props.item.status}</span>
@@ -189,6 +191,8 @@ function ContentItem(props: { item: DeliveredContentItem }) {
       <div className="tagCloud evidenceTags">
         {props.item.evidence.map((evidence) => <span key={evidence}>{evidence}</span>)}
       </div>
+      {props.item.citations?.length ? <details className="executionDetail"><summary>Source quotes ({props.item.citations.length})</summary>{props.item.citations.map((citation, index) => <div key={index}><blockquote>{citation.quote}</blockquote><small>{citation.readUrl}</small></div>)}</details> : null}
+      <FeedbackControls itemId={props.item.id} canOperate={props.canOperate} />
     </article>
   );
 }
@@ -213,65 +217,6 @@ function Scheduler(props: { schedules: RuntimeSchedule[]; onToggle: (schedule: R
           </div>
         </article>
       ))}
-    </div>
-  );
-}
-
-function Memory(props: { snapshot: RuntimeSnapshot }) {
-  const sourceWeights = Object.entries(props.snapshot.memory.sourceWeights) as Array<[string, number]>;
-  return (
-    <div className="splitGrid">
-      <div>
-        <h3>Preference memory</h3>
-        <div className="tagCloud">
-          {props.snapshot.memory.interests.map((interest) => <span key={interest}>{interest}</span>)}
-        </div>
-        <p className="mutedText">Blocked: {props.snapshot.memory.blockedTopics.join(", ")}</p>
-      </div>
-      <div>
-        <h3>Feedback loop</h3>
-        <ul className="compactList">
-          {props.snapshot.memory.recentFeedback.map((feedback) => (
-            <li key={`${feedback.itemId}-${feedback.timestamp}`}>
-              <strong>{feedback.signal.replace("_", " ")}</strong>
-              <small>{feedback.itemId} · {formatTime(feedback.timestamp)}</small>
-            </li>
-          ))}
-        </ul>
-      </div>
-      <div>
-        <h3>Source weights</h3>
-        <ul className="compactList">
-          {sourceWeights.map(([source, weight]) => (
-            <li key={source}>
-              <strong>{source}</strong>
-              <small>{weight.toFixed(1)}x ranking weight</small>
-            </li>
-          ))}
-        </ul>
-      </div>
-      <div>
-        <h3>Lessons</h3>
-        <ul className="compactList">
-          {props.snapshot.memory.recentLessons.map((lesson) => (
-            <li key={`${lesson.title}-${lesson.timestamp}`}>
-              <strong>{lesson.title}</strong>
-              <small>{lesson.principle}</small>
-            </li>
-          ))}
-        </ul>
-      </div>
-      <div className="wideCell">
-        <h3>Preference diffs</h3>
-        <ul className="compactList">
-          {props.snapshot.memory.preferenceDiffs.slice(0, 6).map((diff) => (
-            <li key={`${diff.field}-${diff.key}-${diff.timestamp}`}>
-              <strong>{diff.field}: {diff.key}</strong>
-              <small>{String(diff.before ?? "new")} {"->"} {String(diff.after ?? "removed")} · {formatTime(diff.timestamp)}</small>
-            </li>
-          ))}
-        </ul>
-      </div>
     </div>
   );
 }
@@ -356,7 +301,8 @@ function RunHistory({ canOperate }: { canOperate: boolean }) {
       {cancel.isError ? <p role="alert">{cancel.error.message}</p> : null}
       {detail.data.result?.outcome === "no_new_items" ? <p role="status">No new items</p> : null}
       {detail.data.result?.outcome === "legacy_incomplete" ? <p role="status">Legacy results may be incomplete.</p> : null}
-      {detail.data.result?.items.map((item) => <ContentItem key={item.id} item={item} />)}
+      {detail.data.result?.items.map((item) => <ContentItem key={item.id} item={item} canOperate={canOperate} />)}
+      {detail.data.memoryContext ? <details className="executionDetail"><summary>Memory context</summary><small>Hash {detail.data.memoryContext.hash}</small><pre>{JSON.stringify(detail.data.memoryContext.context, null, 2)}</pre></details> : null}
       {detail.data.events.filter((event) => ["agent.tool.started", "agent.tool.completed", "agent.model.completed", "run.failed"].includes(event.type)).map((event) => <details key={event.id} className="executionDetail">
         <summary>{event.type === "agent.tool.started" ? `Tool call: ${String(event.payload.tool)}` : event.type === "agent.tool.completed" ? `Tool result: ${String(event.payload.tool)}` : event.type === "agent.model.completed" ? `Model: ${String(event.payload.model)} (${String(event.payload.status)})` : "Run failure"}</summary>
         <pre>{JSON.stringify(event.payload, null, 2)}</pre>
@@ -398,6 +344,8 @@ export function App({ canOperate }: { canOperate: boolean }) {
         void queryClient.invalidateQueries({ queryKey: snapshotKey });
         void queryClient.invalidateQueries({ queryKey: ["runtime-runs"] });
         void queryClient.invalidateQueries({ queryKey: ["runtime-run"] });
+        void queryClient.invalidateQueries({ queryKey: ["memory-export"] });
+        void queryClient.invalidateQueries({ queryKey: ["memory-practices"] });
       }, 100);
     };
     stream.addEventListener("snapshot", refresh);
@@ -452,7 +400,7 @@ export function App({ canOperate }: { canOperate: boolean }) {
         </Card>
 
         <Card title="Content Pipeline" eyebrow={`${pipelineCount} events`}>
-          <ContentPipeline snapshot={data} />
+          <ContentPipeline snapshot={data} canOperate={canOperate} />
         </Card>
 
         <Card title="Event Stream" eyebrow="Live via SSE">
@@ -460,7 +408,7 @@ export function App({ canOperate }: { canOperate: boolean }) {
         </Card>
 
         <Card title="Memory" eyebrow="Preferences and feedback">
-          <Memory snapshot={data} />
+          <MemoryWorkbench canOperate={canOperate} items={data.contentItems} runId={data.latestRun?.startedAt ? data.latestRun.id : undefined} />
         </Card>
 
         <Card title="Eval Harness" eyebrow="Acceptance gates">

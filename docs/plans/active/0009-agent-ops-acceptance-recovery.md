@@ -1,6 +1,6 @@
 # 0009 Agent Ops 验收整改计划
 
-状态：用户已批准持续推进。R1 至 R4 已分别验收并推送 `98501c5`、`f320f97`、`dd6be3b`、`1a5d677`，均已核对远端 SHA。R4 确切提交上的真实 DeepSeek、公开来源和浏览器验收通过。R5 计划与验收标准见 `docs/evidence/R5-durable-scheduler.md`；R6-R10 待开始。
+状态：用户已批准持续推进。R1 至 R5 已分别验收并推送 `98501c5`、`f320f97`、`dd6be3b`、`1a5d677`、`6b99dfd`，均已核对远端 SHA。R4 确切提交上的真实 DeepSeek、公开来源和浏览器验收通过。R6 实现、Dashboard 闭环与实际进程重启验收已通过，待独立提交、clean exact-head 复验和推送；R7-R10 待开始。
 
 复核日期：2026-11-01。代码基线：`797ccb8`。
 
@@ -53,8 +53,8 @@
 | R2 | 服务端权限、工具审批和网络限制生效 | 3、10 | security、server、工具执行入口 | 验收通过，已推送 |
 | R3 | run、内容、投递和事件状态一致 | 2、6 | db、runtime | 验收通过，已推送 |
 | R4 | Dashboard 运行真实 agent 与内容流程 | 3、6 | runtime、server、已有 ai/agent 组合 | 验收通过，已推送 |
-| R5 | 定时、排队、取消和重启恢复正确 | 5 | runtime、server | 实现与提交前验收通过，待确切 SHA 验证及推送 |
-| R6 | 偏好、检索和实践更新影响后续运行 | 7 | db、runtime、coding-agent、tui | 待开始 |
+| R5 | 定时、排队、取消和重启恢复正确 | 5 | runtime、server | 验收通过，已推送 `6b99dfd`，远端 SHA 已核对 |
+| R6 | 偏好、检索和实践更新影响后续运行 | 7 | db、runtime、coding-agent、tui、dashboard | 行为、界面和进程验收已通过；待独立提交、clean exact-head 复验和推送，证据见 `docs/evidence/R6-memory-feedback-practices.md` |
 | R7 | 指标、trace 和 heartbeat 来自实际运行 | 9、10 | runtime、server、ai 调用监测 | 待开始 |
 | R8 | Dashboard 完成全部用户操作流程 | 4 | dashboard、对应 server API | 待开始 |
 | R9 | harness 能阻止已知坏行为重新上线 | 8 | evals、各包行为测试、CI | 待开始 |

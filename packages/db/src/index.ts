@@ -277,6 +277,33 @@ const schedulerSchema = [
   "create unique index scheduled_jobs_occurrence on scheduled_jobs(schedule_id, schedule_revision, scheduled_for) where trigger = 'schedule'",
 ];
 
+const memorySchema = [
+  "create table memory_preference_changes (id text primary key, field text not null, key text not null, before_json text not null, after_json text not null, actor text not null, created_at text not null)",
+  "alter table memory_entries add column actor text not null default 'legacy'",
+  "alter table feedback add column actor text not null default 'legacy'",
+  "create table feedback_history (id text primary key, item_id text not null, signal text not null, actor text not null, created_at text not null)",
+  "insert into feedback_history select id, item_id, signal, actor, created_at from feedback",
+  "delete from feedback where rowid not in (select max(rowid) from feedback group by actor, item_id)",
+  "create unique index feedback_actor_item on feedback(actor, item_id)",
+  "create table feedback_requests (actor text not null, request_key text not null, intent_hash text not null, receipt_json text not null, primary key(actor,request_key))",
+  "create table memory_state (id integer primary key check(id=1), epoch integer not null)",
+  "insert into memory_state values (1, 0)",
+  "create table run_memory_contexts (run_id text primary key, context_json text not null, context_hash text not null, created_at text not null, epoch integer not null)",
+];
+
+const practiceSchema = [
+  "create table practice_versions (id text primary key, definition_json text not null, definition_hash text not null, epoch integer not null, actor text not null, created_at text not null)",
+  "create table practice_reviews (id text primary key, version_id text not null unique references practice_versions(id), decision text not null check(decision in ('approved','rejected')), actor text not null, reason text not null, created_at text not null)",
+  "create table practice_evaluations (id text primary key, version_id text not null references practice_versions(id), report_json text not null, report_hash text not null, created_at text not null)",
+  "create table practice_state (id integer primary key check(id=1), version_id text references practice_versions(id), revision integer not null)",
+  "insert into practice_state values (1, null, 0)",
+  "create table practice_activations (id text primary key, revision integer not null unique, from_id text references practice_versions(id), to_id text references practice_versions(id), evaluation_id text references practice_evaluations(id), action text not null check(action in ('activate','rollback','clear')), actor text not null, created_at text not null)",
+];
+
+const localImportSchema = [
+  "create table legacy_task_imports (source_key text primary key, manifest_hash text not null, receipt_json text not null, actor text not null, created_at text not null)",
+];
+
 export function migrateSqliteDatabase(database: SqliteDatabase): void {
   const { sqlite } = database;
   const migrations = [
@@ -294,6 +321,15 @@ export function migrateSqliteDatabase(database: SqliteDatabase): void {
     } },
     { version: 4, name: "durable-scheduler-v1", statements: schedulerSchema, apply: () => {
       for (const statement of schedulerSchema) sqlite.exec(statement);
+    } },
+    { version: 5, name: "transactional-memory-v1", statements: memorySchema, apply: () => {
+      for (const statement of memorySchema) sqlite.exec(statement);
+    } },
+    { version: 6, name: "reviewed-practice-versions-v1", statements: practiceSchema, apply: () => {
+      for (const statement of practiceSchema) sqlite.exec(statement);
+    } },
+    { version: 7, name: "local-task-import-receipts-v1", statements: localImportSchema, apply: () => {
+      for (const statement of localImportSchema) sqlite.exec(statement);
     } },
   ];
   sqlite.transaction(() => {

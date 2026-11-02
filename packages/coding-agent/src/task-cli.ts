@@ -4,6 +4,7 @@ import {
   listScheduledTasks,
   recordTaskFeedback,
   runDueTasks,
+  runTaskDaemon,
   runScheduledTask,
   updatePreferences,
   type CreateTaskArgs,
@@ -12,11 +13,13 @@ import {
   type TaskRuntimeOptions,
 } from "./tasks.js";
 import type { CliIo } from "./cli.js";
+import { importLegacyTasks } from "./legacy-task-import.js";
 
 export type TaskCliCommand =
   | { kind: "help" }
   | { kind: "create"; args: CreateTaskArgs; cwd?: string }
   | { kind: "list"; cwd?: string }
+  | { kind: "import-legacy"; cwd?: string }
   | { kind: "run"; id: string; cwd?: string }
   | { kind: "run-due"; cwd?: string }
   | { kind: "daemon"; cwd?: string; intervalMs: number; once?: boolean }
@@ -26,8 +29,9 @@ export type TaskCliCommand =
 const USAGE = `Usage: simple-coding-agent-task <command> [options]
 
 Commands:
-  create ID [--title TITLE] [--every 6h] [--source mock|browser|rss] [--url URL] [--query TEXT]
+  create ID --source mock|browser|rss|url [--title TITLE] [--every 6h] [--url URL] [--query TEXT]
   list
+  import-legacy
   run ID
   run-due
   daemon [--interval-ms 60000] [--once]
@@ -35,7 +39,7 @@ Commands:
   preferences [--interests a,b] [--blocked-topics x,y]
 
 Options:
-  --cwd PATH       Store docs/agent state under PATH
+  --cwd PATH       Resolve AGENT_DB_PATH under PATH (default data/agent-ops.sqlite)
   --help          Show help
 `;
 
@@ -52,21 +56,21 @@ function normalizeError(error: unknown): string {
 
 function takeOption(argv: readonly string[], index: number, name: string): string {
   const value = argv[index + 1];
-  if (!value) throw new TaskCliUsageError(`${name} requires a value`);
+  if (value === undefined) throw new TaskCliUsageError(`${name} requires a value`);
   return value;
 }
 
 function splitCsv(value: string | undefined): string[] | undefined {
-  if (!value) return undefined;
+  if (value === undefined) return undefined;
   const items = value
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
-  return items.length === 0 ? undefined : items;
+  return items;
 }
 
 function requireSource(value: string): SourceKind {
-  if (value === "mock" || value === "browser" || value === "rss") return value;
+  if (value === "mock" || value === "browser" || value === "rss" || value === "url") return value;
   throw new TaskCliUsageError(`Unknown source: ${value}`);
 }
 
@@ -118,6 +122,7 @@ export function parseTaskCliArgs(argv: readonly string[]): TaskCliCommand {
     };
   }
   if (command === "list") return { kind: "list", cwd };
+  if (command === "import-legacy") return { kind: "import-legacy", cwd };
   if (command === "run") {
     if (!positional[0]) throw new TaskCliUsageError("run requires ID");
     return { kind: "run", id: positional[0], cwd };
@@ -144,11 +149,8 @@ export function parseTaskCliArgs(argv: readonly string[]): TaskCliCommand {
   throw new TaskCliUsageError(`Unknown command: ${command}`);
 }
 
-function runtimeFor(command: { cwd?: string }): TaskRuntimeOptions {
-  return { allowedRoot: command.cwd ?? process.cwd() };
-}
-
-export async function runTaskCli(argv: readonly string[], io: CliIo): Promise<number> {
+export async function runTaskCli(argv: readonly string[], io: CliIo, env: Record<string, string | undefined> = process.env): Promise<number> {
+  const runtimeFor = (command: { cwd?: string }): TaskRuntimeOptions => ({ allowedRoot: command.cwd ?? process.cwd(), env });
   let command: TaskCliCommand;
   try {
     command = parseTaskCliArgs(argv);
@@ -171,6 +173,10 @@ export async function runTaskCli(argv: readonly string[], io: CliIo): Promise<nu
       io.stdout.write(`${formatTaskList(await listScheduledTasks(runtimeFor(command)))}\n`);
       return 0;
     }
+    if (command.kind === "import-legacy") {
+      io.stdout.write(`${JSON.stringify(await importLegacyTasks(runtimeFor(command)), null, 2)}\n`);
+      return 0;
+    }
     if (command.kind === "run") {
       const result = await runScheduledTask(command.id, runtimeFor(command));
       io.stdout.write(`Ran ${result.taskId}: ${result.itemCount} items\nDigest: ${result.digestPath}\n`);
@@ -182,12 +188,14 @@ export async function runTaskCli(argv: readonly string[], io: CliIo): Promise<nu
       return 0;
     }
     if (command.kind === "daemon") {
-      do {
-        const results = await runDueTasks(runtimeFor(command));
-        io.stdout.write(`${new Date().toISOString()} ran ${results.length} due task(s)\n`);
-        if (command.once) return 0;
-        await new Promise((resolve) => setTimeout(resolve, command.intervalMs));
-      } while (true);
+      const controller = new AbortController();
+      const stop = () => controller.abort();
+      process.once("SIGINT", stop); process.once("SIGTERM", stop);
+      try {
+        await runTaskDaemon(runtimeFor(command), { intervalMs: command.intervalMs, once: command.once, signal: controller.signal,
+          onTick: (results) => { io.stdout.write(`${new Date().toISOString()} ran ${results.length} due task(s)\n`); } });
+      } finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
+      return 0;
     }
     if (command.kind === "feedback") {
       await recordTaskFeedback(command, runtimeFor(command));

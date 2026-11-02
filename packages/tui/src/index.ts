@@ -40,6 +40,7 @@ export type TuiCommand =
 export type TuiRunOptions = {
   signal?: AbortSignal;
   input?: TuiInput;
+  taskEnvironment?: Record<string, string | undefined>;
 };
 
 type TuiRuntimeCommand = Extract<TuiCommand, { kind: "run" }> & { kind: "run"; mode: "print" };
@@ -61,6 +62,7 @@ type TuiState = {
   model?: string;
   thinking?: boolean;
   sessionPath?: string;
+  taskEnvironment?: Record<string, string | undefined>;
 };
 
 type TuiRenderState = {
@@ -424,7 +426,7 @@ async function runWorkflowCommand(name: string, value: string, state: TuiState, 
 }
 
 async function runTaskCommand(name: string, value: string, state: TuiState, io: CliIo): Promise<boolean> {
-  const runtime = workflowRoot(state);
+  const runtime = { ...workflowRoot(state), env: state.taskEnvironment };
   if (name === "/tasks") {
     io.stdout.write(`${styles.label("Tasks")}\n${indent(formatTaskList(await listScheduledTasks(runtime)))}\n`);
     return true;
@@ -439,7 +441,7 @@ async function runTaskCommand(name: string, value: string, state: TuiState, io: 
       {
         id,
         every: every || undefined,
-        source: source === "browser" || source === "rss" || source === "mock" ? source : undefined,
+        source: source === "browser" || source === "rss" || source === "mock" || source === "url" ? source : undefined,
         url: url || undefined,
         query: query || undefined,
       },
@@ -580,6 +582,7 @@ async function runInteractiveTui(
     model: command.model,
     thinking: command.thinking,
     sessionPath: command.sessionPath,
+    taskEnvironment: options.taskEnvironment,
   };
 
   const input = options.input ?? (await createDefaultInput());

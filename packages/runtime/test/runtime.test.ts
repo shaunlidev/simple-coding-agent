@@ -261,7 +261,8 @@ test("memory feedback changes next-run ranking and preference diffs", async () =
   assert.equal((saved?.score ?? 0) > (ignored?.score ?? 0), true);
   assert.equal(saved?.evidence.includes("feedback: saved"), true);
   assert.equal(ignored?.evidence.includes("feedback: not interested"), true);
-  assert.equal(memory.preferenceDiffs.some((diff) => diff.field === "sourceWeights" && diff.key.includes("feedback:")), true);
+  assert.equal(memory.preferenceDiffs.some((diff) => diff.field === "sourceWeights" && diff.key.includes("feedback:")), false);
+  assert.ok(memory.recentFeedback.some((entry) => entry.itemId === saved?.id && entry.signal === "saved"));
   store.database.sqlite.close();
 });
 

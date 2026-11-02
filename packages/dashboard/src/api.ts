@@ -106,6 +106,7 @@ export type DeliveredContentItem = {
   score: number;
   status: "delivered" | "already_delivered" | "filtered" | "failed";
   evidence: string[];
+  citations?: { documentId: string; readUrl: string; quote: string; hash: string }[];
   createdAt: string;
 };
 
@@ -205,7 +206,7 @@ export async function runNow(key: string, taskId?: string): Promise<{ accepted: 
   return requestJson<{ accepted: true; runId: string }>("/api/runs/run-now", { method: "POST", headers: { "idempotency-key": key }, body: JSON.stringify(taskId ? { taskId } : {}) });
 }
 
-export type ContentTask = { id: string; title: string; instruction: string; model: string; sources: { id: string; kind: "rss" | "url" | "browser"; url: string }[] };
+export type ContentTask = { id: string; title: string; instruction: string; model: string; mode?: "live" | "demo"; sources: { id: string; kind: "rss" | "url" | "browser" | "mock"; url: string; query?: string }[] };
 export type ContentTaskRecord = { definition: ContentTask; revision: number; updatedAt: string };
 export const fetchTasks = () => requestJson<{ tasks: ContentTaskRecord[]; demoMode: boolean; defaultModel: string }>("/api/tasks");
 export const saveTask = (definition: ContentTask) => requestJson<ContentTaskRecord>(`/api/tasks/${encodeURIComponent(definition.id)}`, { method: "PUT", body: JSON.stringify({ definition, expectedRevision: 0 }) });
@@ -214,6 +215,7 @@ export type RunDetail = {
   run: RuntimeRun;
   events: RuntimeEvent[];
   result: { outcome: "delivered" | "no_new_items" | "legacy_incomplete"; digest: string; items: DeliveredContentItem[]; deliveredCount: number } | null;
+  memoryContext: { hash: string; context: { capturedAt: string; profile: Pick<MemoryState, "interests" | "blockedTopics" | "sourceWeights">; knowledge: MemoryHit[]; practice: { id: string; hash: string; rules: PracticeRule[] } | null; feedback: FeedbackRecord[] } } | null;
 };
 
 export const fetchRuns = () => requestJson<{ runs: RuntimeRun[] }>("/api/runs");
@@ -227,4 +229,35 @@ export async function patchSchedule(id: string, patch: Partial<Pick<RuntimeSched
     method: "PATCH",
     body: JSON.stringify(patch),
   });
+}
+
+export type FeedbackSignal = "clicked" | "saved" | "not_interested" | "dismissed";
+export type FeedbackRecord = { id: string; item_id: string; signal: FeedbackSignal; actor: string; created_at: string };
+export type MemoryHit = { id: string; kind: string; content: string; metadata: Record<string, unknown>; source: { actor: string; trust: string; createdAt: string } };
+export type PracticeRule = { kind: "minimum_quotes"; count: number } | { kind: "source_delivery_cap"; maximum: number } | { kind: "source_rank_bias"; sourceId: string; delta: number };
+export type PracticeEvidence = { kind: "feedback"; feedbackId: string } | { kind: "run_result"; runId: string; contentId: string };
+export type PracticeVersion = { id: string; hash: string; actor: string; createdAt: string; definition: { title: string; principle: string; parentId: string | null; rules: PracticeRule[]; evidence: { reference: PracticeEvidence; source: string; contentId: string; runId: string; summary: string; signal?: FeedbackSignal; hash: string }[] } };
+export type PracticeList = {
+  state: { version_id: string | null; revision: number };
+  versions: PracticeVersion[];
+  reviews: { id: string; version_id: string; decision: "approved" | "rejected"; reason: string; actor: string; created_at: string }[];
+  evaluations: { id: string; report: { versionId: string; versionHash: string; baselineRevision: number; purpose: "candidate" | "build-revalidation"; compilerHash: string; evidenceKind: string; passed: boolean; checks: { name: string; passed: boolean; expected: string; actual: string }[] } }[];
+  activations: { id: string; from_id: string | null; to_id: string | null; action: string; actor: string; created_at: string; revision: number }[];
+};
+export type MemoryExport = { memory: MemoryState; entries: { id: string; kind: string; content: string; metadata: Record<string, unknown>; sourceTrust: string; createdAt: string }[]; feedback: FeedbackRecord[]; practices: PracticeList; historyPolicy: string };
+export const fetchMemory = () => requestJson<MemoryExport>("/api/memory/export");
+export const fetchPractices = () => requestJson<PracticeList>("/api/memory/practices");
+export const saveFeedback = (input: { itemId: string; signal: FeedbackSignal; requestKey: string }) => requestJson<{ feedback: { id: string; changed: boolean } }>("/api/memory/feedback", { method: "POST", body: JSON.stringify(input) });
+export const savePreferences = (input: Partial<Pick<MemoryState, "interests" | "blockedTopics" | "sourceWeights">>) => requestJson<MemoryState>("/api/memory/preferences", { method: "PATCH", body: JSON.stringify(input) });
+export const addKnowledge = (input: { content: string; metadata: { url?: string } }) => requestJson("/api/memory/entries", { method: "POST", body: JSON.stringify({ ...input, kind: "knowledge" }) });
+export const searchKnowledge = (query: string) => requestJson<{ results: MemoryHit[] }>(`/api/memory/search?q=${encodeURIComponent(query)}`);
+export const proposePractice = (input: { title: string; principle: string; rules: PracticeRule[]; evidence: PracticeEvidence[]; parentId?: string }) => requestJson<PracticeVersion>("/api/memory/practices", { method: "POST", body: JSON.stringify(input) });
+export const reviewPractice = (input: { id: string; decision: "approved" | "rejected"; reason: string }) => requestJson(`/api/memory/practices/${encodeURIComponent(input.id)}/review`, { method: "POST", body: JSON.stringify({ decision: input.decision, reason: input.reason }) });
+export const evaluatePractice = (id: string) => requestJson<PracticeList["evaluations"][number]>(`/api/memory/practices/${encodeURIComponent(id)}/evaluate`, { method: "POST", body: "{}" });
+export const activatePractice = (input: { id: string; evaluationId: string; expectedRevision: number }) => requestJson(`/api/memory/practices/${encodeURIComponent(input.id)}/activate`, { method: "POST", body: JSON.stringify({ evaluationId: input.evaluationId, expectedRevision: input.expectedRevision, confirmation: "activate-practice" }) });
+export const rollbackPractice = (expectedRevision: number) => requestJson("/api/memory/practices/rollback", { method: "POST", body: JSON.stringify({ expectedRevision, confirmation: "rollback-practice" }) });
+export const requestMemoryClear = (runId: string) => requestJson<{ id: string }>("/api/security/approvals", { method: "POST", body: JSON.stringify({ runId, tool: "memory_clear", args: { confirmation: "clear-memory" } }) });
+export async function approveMemoryClear(input: { runId: string; approvalId: string }) {
+  await requestJson(`/api/security/approvals/${encodeURIComponent(input.approvalId)}/approve`, { method: "POST", body: "{}" });
+  return requestJson("/api/memory", { method: "DELETE", body: JSON.stringify(input) });
 }

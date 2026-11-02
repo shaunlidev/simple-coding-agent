@@ -2,6 +2,7 @@ import { z } from "zod";
 import { permittedUrl } from "./network.js";
 import { redactSecrets } from "./redaction.js";
 export { createRedactor, redactSecrets } from "./redaction.js";
+export { parseAuthUsers, equalSecret, authenticateLocalIdentity, requireOperator, type AuthIdentity } from "./identity.js";
 export { SafeNetwork, createCloudflareResolver, isPublicAddress, permittedUrl, pinnedLookup, type NetworkDocument } from "./network.js";
 
 export const envSchema = z.object({

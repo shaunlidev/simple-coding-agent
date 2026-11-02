@@ -1,22 +1,16 @@
 import cookie from "@fastify/cookie";
 import session, { type SessionStore } from "@fastify/session";
 import rateLimit from "@fastify/rate-limit";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { SqliteDatabase } from "@simple-coding-agent/db";
-import type { AgentEnvironment } from "@simple-coding-agent/security";
+import { parseAuthUsers, equalSecret, type AgentEnvironment } from "@simple-coding-agent/security";
+export { parseAuthUsers } from "@simple-coding-agent/security";
 import type { SQLiteRuntimeStore } from "@simple-coding-agent/runtime";
 import { z } from "zod";
 
 const sessionTtlMs = 8 * 60 * 60 * 1000;
-const userSchema = z.object({
-  id: z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/),
-  role: z.enum(["viewer", "operator"]),
-  secret: z.string().min(32).max(256),
-}).strict();
-const usersSchema = z.array(userSchema).max(50).refine((users) => new Set(users.map((user) => user.id)).size === users.length, "Duplicate identity");
 const loginSchema = z.object({ id: z.string().max(64), secret: z.string().max(256) }).strict();
-type AuthUser = z.infer<typeof userSchema>;
 
 declare module "fastify" {
   interface Session {
@@ -46,10 +40,6 @@ const storedSessionSchema = z.object({
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function equalSecret(left: string, right: string): boolean {
-  return timingSafeEqual(Buffer.from(digest(left), "hex"), Buffer.from(digest(right), "hex"));
 }
 
 function missingSession() {
@@ -96,16 +86,6 @@ export function createSessionStore(database: SqliteDatabase): SessionStore {
       catch { callback(new Error("Session revocation failed")); }
     },
   };
-}
-
-export function parseAuthUsers(env: AgentEnvironment) {
-  let users: AuthUser[];
-  try { users = usersSchema.parse(JSON.parse(env.AGENT_AUTH_USERS)); }
-  catch { throw new Error("AGENT_AUTH_USERS must contain unique id, viewer/operator role and a 32-character secret per identity"); }
-  if (env.NODE_ENV === "production" && !users.some((user) => user.role === "operator")) {
-    throw new Error("Production requires a configured operator in AGENT_AUTH_USERS");
-  }
-  return users;
 }
 
 export async function registerAuthentication(app: FastifyInstance, env: AgentEnvironment, runtime: SQLiteRuntimeStore, users = parseAuthUsers(env)) {

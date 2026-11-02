@@ -7,7 +7,7 @@ type Json = z.infer<typeof jsonSchema>;
 export type RegisteredTool = {
   requiresApproval: boolean;
   parameters: z.ZodType<Json>;
-  execute: (args: Json) => Promise<unknown>;
+  execute: (args: Json, context: { actor: string; runId: string }) => Promise<unknown>;
 };
 const approvalSchema = z.object({
   id: z.string(), run_id: z.string(), tool: z.string(), args_hash: z.string(),
@@ -88,7 +88,7 @@ export class GuardedToolExecutor {
       }
       await this.audit(input, "execution_authorized", input.approvalId);
       authorized = true;
-      const result = await tool.execute(args);
+      const result = await tool.execute(args, { actor: input.actor, runId: input.runId });
       await this.audit(input, "execution_completed", input.approvalId);
       return result;
     } catch (error) {

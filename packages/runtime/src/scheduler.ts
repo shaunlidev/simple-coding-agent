@@ -224,7 +224,7 @@ export class RuntimeScheduler {
       const next = jobSchema.parse(value);
       const detail = this.store.readRunDetail(next.run_id);
       if (!detail) throw new Error("Queued run has no admission event");
-      this.event(next.run_id, "run.started", { taskId: detail.run.taskId, title: detail.run.title, trigger: next.trigger, mode: detail.task ? "live" : "demo", ...(detail.task ? { taskRevision: detail.task.revision } : {}) });
+      this.event(next.run_id, "run.started", { taskId: detail.run.taskId, title: detail.run.title, trigger: next.trigger, mode: detail.task?.definition.mode ?? "demo", ...(detail.task ? { taskRevision: detail.task.revision } : {}) });
       return next;
     }).immediate();
     if (!job) return;

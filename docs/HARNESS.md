@@ -31,9 +31,9 @@ Capture:
 - CLI tests cover stdout, stderr, exit codes, session records, resume, and secret redaction failures.
 - Browser tool tests cover adapter call order and clear missing-implementation failures.
 - Workflow tests cover requirement capture, backlog listing, plan creation, and verification evidence.
-- Task runtime tests cover scheduler creation, due-task selection, append-only events, run records, memory preferences, feedback history, ranking, Markdown digest delivery, and browser-source collection through an injected adapter.
-- Task CLI tests cover create/list/run/feedback over durable `docs/agent` files.
-- The opt-in browser live eval starts a local social-style page, collects it through Playwright, and verifies the generated digest.
+- Task runtime tests cover shared SQLite schedules/receipts, due-task selection, feedback replacement, ranking, unique Markdown exports, credentials, worker ownership and atomic legacy imports.
+- Task CLI process tests and TUI tests use the same authenticated local host; API integration tests compare task IDs, preferences, feedback and scores before/after restart.
+- The opt-in browser eval uses actual Chromium with controlled source/model data through guarded transport and verifies the generated digest.
 - TUI tests cover startup, one-shot mode, interactive multi-turn reuse, slash-command resets, streaming text deltas without final duplication, rendered status, tool events, session records, abort, and no-key failure.
 - Local evals cover read, edit, path escape rejection, tool-error recovery, and max-turn stop.
 

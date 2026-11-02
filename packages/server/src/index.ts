@@ -5,8 +5,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RuntimeScheduler, SQLiteRuntimeStore, contentTaskSchema, executeContentRun, nextRunAt, type ContentProviderFactory, type RuntimeSchedule } from "@simple-coding-agent/runtime";
-import { createDeepSeekProvider } from "@simple-coding-agent/ai";
+import { RuntimeScheduler, SQLiteRuntimeStore, contentTaskSchema, practiceProposalSchema, createContentExecutor, nextRunAt, type ContentProviderFactory, type RuntimeSchedule } from "@simple-coding-agent/runtime";
 import { SafeNetwork, createCloudflareResolver, createRedactor, evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
 import { z } from "zod";
 import { parseAuthUsers, registerAuthentication } from "./auth.js";
@@ -44,9 +43,10 @@ const patchScheduleSchema = z.object({
 const schedulerTickSchema = z.object({}).strict();
 
 const feedbackSchema = z.object({
-  itemId: z.string().min(1),
+  itemId: z.string().min(1).max(256),
   signal: z.enum(["clicked", "saved", "not_interested", "dismissed"]),
-});
+  requestKey: z.string().min(1).max(128).optional(),
+}).strict();
 
 const memoryEntrySchema = z.object({
   kind: z.enum(["preference", "blocked_topic", "source_weight", "lesson", "knowledge"]),
@@ -95,11 +95,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   const urlAllowlist = parseUrlAllowlist(env.AGENT_URL_ALLOWLIST);
   if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
   const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH, network: options.network ?? new SafeNetwork({ allowlist: urlAllowlist, ...(env.AGENT_DNS_MODE === "cloudflare" ? { resolve: createCloudflareResolver() } : {}) }), secrets: [env.DEEPSEEK_API_KEY ?? "", env.AGENT_SESSION_SECRET ?? "", ...users.map((user) => user.secret)] });
-  const providerFactory: ContentProviderFactory = options.providerFactory ?? ((task) => {
-    if (!env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY is required for real content runs");
-    return createDeepSeekProvider({ apiKey: env.DEEPSEEK_API_KEY, model: task.model, stream: true, maxOutputTokens: task.limits.maxOutputTokens, responseFormat: "json_object", toolChoice: "required" });
-  });
-  const scheduler = new RuntimeScheduler({ runtime, now: options.now, ...(env.AGENT_DEMO_MODE === "1" ? {} : { runAgent: ({ runId, signal }: { runId: string; signal: AbortSignal }) => executeContentRun(runtime, runId, { providerFactory, signal, alreadyStarted: true }) }) });
+  const scheduler = new RuntimeScheduler({ runtime, now: options.now, runAgent: createContentExecutor(runtime, { env, providerFactory: options.providerFactory }) });
   const app = Fastify({
     logger: options.logger ? {
       ...(options.logStream ? { stream: options.logStream } : {}),
@@ -127,7 +123,11 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   await app.register(cors, { origin: env.AGENT_CORS_ORIGIN, credentials: true });
   const auth = await registerAuthentication(app, env, runtime, users);
   const executor = new GuardedToolExecutor({ runtime, tools: new Map([
-    ["memory_clear", { requiresApproval: true, parameters: z.object({ confirmation: z.literal("clear-memory") }).strict(), execute: async () => { await runtime.clearMemory(); return { ok: true }; } }],
+    ["memory_clear", { requiresApproval: true, parameters: z.object({ confirmation: z.literal("clear-memory") }).strict(), execute: async (_args, context) => {
+      await runtime.clearMemory(context.actor);
+      for (const job of scheduler.listJobs()) if (job.state === "cancelling" && job.reason === "memory_cleared") scheduler.cancel(job.run_id, context.actor);
+      return { ok: true, historicalRunInputsRetained: true };
+    } }],
   ]) });
 
   const dashboardRoot = options.dashboardRoot ?? fileURLToPath(new URL("../../dashboard/dist/", import.meta.url));
@@ -184,7 +184,11 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   app.post("/api/runs/run-now", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request) => {
     const body = z.object({ taskId: z.string().min(1).optional() }).strict().parse(request.body ?? {});
     const identity = runRequest(request);
-    if (!body.taskId && env.AGENT_DEMO_MODE === "1") return { accepted: true, runId: await scheduler.runNow(undefined, identity) };
+    if (!body.taskId && env.AGENT_DEMO_MODE === "1" && env.NODE_ENV !== "production") {
+      const runId = await scheduler.runNow(undefined, identity);
+      await scheduler.idle();
+      return { accepted: true, runId };
+    }
     const taskId = z.string().min(1, "Select a configured content task").parse(body.taskId ?? "");
     return { accepted: true, runId: await scheduler.runTask(taskId, identity) };
   });
@@ -199,7 +203,9 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   app.put("/api/tasks/:id", async (request: FastifyRequest<{ Params: { id: string } }>) => {
     const input = z.object({ definition: contentTaskSchema, expectedRevision: z.number().int().nonnegative() }).strict().parse(request.body);
     if (input.definition.id !== request.params.id) throw Object.assign(new Error("Task ID mismatch"), { statusCode: 400 });
+    if (input.definition.mode === "demo" && env.NODE_ENV === "production") throw Object.assign(new Error("Demo content tasks are disabled in production"), { statusCode: 400 });
     for (const source of input.definition.sources) {
+      if (source.kind === "mock") continue;
       try { await runtime.network.validate(source.url); }
       catch { throw Object.assign(new Error(`Source ${source.id} is outside the configured network policy or unavailable`), { statusCode: 400 }); }
     }
@@ -213,6 +219,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       if (!schedule?.taskId) throw Object.assign(new Error("Schedule has no configured content task"), { statusCode: 400 });
     }
     const runId = await scheduler.runNow(request.params.id, runRequest(request));
+    if (env.AGENT_DEMO_MODE === "1" && !(await runtime.readSchedules()).find((schedule) => schedule.id === request.params.id)?.taskId) await scheduler.idle();
     return { accepted: true, runId };
   });
 
@@ -223,6 +230,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       return { error: { code: "INVALID_SCHEDULER_TICK", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
     }
     const results = await scheduler.tick(options.now?.() ?? new Date());
+    if (env.AGENT_DEMO_MODE === "1") await scheduler.idle();
     return { results };
   });
 
@@ -288,6 +296,49 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
 
   app.get("/api/memory/export", async () => await runtime.exportMemory());
 
+  app.patch("/api/memory/preferences", async (request, reply) => {
+    const body = z.object({ interests: z.array(z.string()).optional(), blockedTopics: z.array(z.string()).optional(), sourceWeights: z.record(z.string(), z.number()).optional() }).strict().parse(request.body);
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return runtime.memory.replacePreferences(body, actor.id);
+  });
+
+  app.get("/api/memory/practices", async () => runtime.practices.list());
+  app.post("/api/memory/practices", async (request, reply) => {
+    const body = practiceProposalSchema.safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: { code: "INVALID_PRACTICE", message: body.error.message } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return runtime.practices.propose(body.data, actor.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/memory/practices/:id/review", async (request, reply) => {
+    const body = z.object({ decision: z.enum(["approved", "rejected"]), reason: z.string().trim().min(1).max(2000) }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: { code: "INVALID_REVIEW" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return runtime.practices.review(request.params.id, body.data.decision, body.data.reason, actor.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/memory/practices/:id/evaluate", async (request, reply) => {
+    if (!z.object({}).strict().safeParse(request.body).success) return reply.code(400).send({ error: { code: "INVALID_EVALUATION_REQUEST" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return runtime.practices.evaluate(request.params.id, actor.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/memory/practices/:id/activate", async (request, reply) => {
+    const body = z.object({ evaluationId: z.string().uuid(), expectedRevision: z.number().int().nonnegative(), confirmation: z.literal("activate-practice") }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: { code: "INVALID_ACTIVATION" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return runtime.practices.activate(request.params.id, body.data.evaluationId, body.data.expectedRevision, actor.id);
+  });
+  app.post("/api/memory/practices/rollback", async (request, reply) => {
+    const body = z.object({ expectedRevision: z.number().int().nonnegative(), confirmation: z.literal("rollback-practice") }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: { code: "INVALID_ROLLBACK" } });
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    return runtime.practices.rollback(body.data.expectedRevision, actor.id);
+  });
+
   app.post("/api/security/approvals", async (request, reply) => {
     const parsed = operationSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: { code: "INVALID_OPERATION", message: "Provide runId, registered tool and arguments only" } });
@@ -335,8 +386,10 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       reply.status(400);
       return { error: { code: "INVALID_FEEDBACK", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
     }
-    await runtime.recordFeedback(parsed.data.itemId, parsed.data.signal);
-    return { ok: true, memory: await runtime.readMemory() };
+    const actor = auth.currentUser(request);
+    if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+    const feedback = await runtime.recordFeedback(parsed.data.itemId, parsed.data.signal, actor.id, parsed.data.requestKey);
+    return { ok: true, feedback, memory: await runtime.readMemory() };
   });
 
   app.post("/api/memory/entries", async (request, reply) => {
@@ -346,7 +399,9 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       return { error: { code: "INVALID_MEMORY_ENTRY", message: parsed.error.issues.map((issue) => issue.message).join("; ") } };
     }
     try {
-      return await runtime.writeMemoryEntry({ ...parsed.data, sourceTrust: "user" });
+      const actor = auth.currentUser(request);
+      if (!actor) return reply.code(401).send({ error: { code: "AUTH_REQUIRED" } });
+      return await runtime.writeMemoryEntry({ ...parsed.data, sourceTrust: "user" }, actor.id);
     } catch (error) {
       await runtime.appendEvent(runtime.createEvent(`memory-denied-${Date.now().toString(36)}`, "security.policy.denied", {
         action: "memory.write",

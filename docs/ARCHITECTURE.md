@@ -56,6 +56,15 @@ Migrations journal versions/checksums and upgrade the previous unversioned layou
 
 `runtime/scheduler.ts` owns all server execution, including manual task runs. Fastify injects the executor and passes authenticated commands; it has no separate active-run map. SQLite `scheduled_jobs` is the dispatch authority, with FIFO sequence, immutable admission target and frozen task snapshot. Admission and automatic cursor advancement share a transaction; claim/start, cancellation intent and terminal completion update job and event records together. The existing result transaction also commits the terminal job state.
 
+`coding-agent/tasks.ts` is a terminal adapter over `runtime/local-host.ts`.
+The local host authenticates an environment-supplied identity using the shared
+security module before opening the database. Both server and terminal compose
+`createContentExecutor` and `RuntimeScheduler`; there is no second terminal
+collector, scorer or JSON scheduler. `coding-agent` therefore also depends on
+`runtime`; the runtime never imports terminal/server/UI packages. Terminal digests
+are exports. Explicit legacy import records a manifest and paused configuration
+transactionally, preserving old files without promoting unbound legacy feedback.
+
 One process holds an exclusive transaction on a separate, canonical-path sibling SQLite lock database. The business database remains available for ordinary reads/writes. Ownership is cooperative and restricted to one host with local persistent storage; no expiring lease permits a second process to take over a hung owner. Graceful shutdown drains before releasing the lock; process death releases it through OS locking. Restart fails interrupted attempts and retains unstarted work. Heartbeat will report health in R7, not grant ownership.
 
 `schedule-time.ts` uses pinned cron-parser plus node-cron validation. A timezone-explicit node-cron poll wakes reconciliation; the persisted due cursor decides admission. Intervals retain phase, cron/DST behavior is pinned by tests, and missed ranges coalesce without unbounded enumeration. Cancellation commits a write fence before aborting the executor. A replacement cannot start until the old execution settles; already-sent remote requests cannot be undone.
