@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { observationContextSchema, observationStartSchema, observationCompleteSchema, observationDeniedSchema } from "./telemetry.js";
 
 const count = z.number().int().nonnegative();
 const measured = {
@@ -12,6 +13,10 @@ const stage = z.object({ ...measured, count }).catchall(z.json());
 const note = z.object(measured).catchall(z.json());
 
 const payloadSchemas = {
+  "observation.context": observationContextSchema,
+  "observation.started": observationStartSchema,
+  "observation.completed": observationCompleteSchema,
+  "observation.denied": observationDeniedSchema,
   "scheduler.task_due": z.object({ ...measured, scheduleId: z.string().optional(), taskId: z.string().optional(), reason: z.string().optional() }).catchall(z.json()),
   "run.queued": z.object({ title: z.string().min(1), taskId: z.string().min(1), trigger: z.enum(["manual", "schedule", "demo"]) }).catchall(z.json()),
   "run.started": z.object({ ...measured, title: z.string().min(1), taskId: z.string().optional(), trigger: z.enum(["manual", "schedule", "demo"]).default("manual") }).catchall(z.json()),

@@ -36,7 +36,7 @@ export type Usage = {
   output: number;
   totalTokens: number;
   cacheReadInput?: number;
-  cacheWriteInput?: number;
+  cacheMissInput?: number;
 };
 
 export type AssistantMessage = {
@@ -100,6 +100,7 @@ export type ProviderContext = {
 
 export type StreamOptions = {
   signal?: AbortSignal;
+  maxOutputTokens?: number;
 };
 
 export type Provider = {

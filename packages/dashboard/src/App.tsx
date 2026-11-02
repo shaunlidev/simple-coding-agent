@@ -7,11 +7,14 @@ import { TaskConfig } from "./TaskConfig.js";
 import { ScheduleConfig } from "./ScheduleConfig.js";
 import { FeedbackControls } from "./FeedbackControls.js";
 import { MemoryWorkbench } from "./MemoryWorkbench.js";
+import { Monitoring } from "./Monitoring.js";
+import { Download } from "lucide-react";
+import { fetchTrace } from "./api.js";
 
 const snapshotKey = ["runtime-snapshot"] as const;
 
-function formatNumber(value: number, options: Intl.NumberFormatOptions = {}) {
-  return new Intl.NumberFormat("en", options).format(value);
+function formatNumber(value: number | null | undefined, options: Intl.NumberFormatOptions = {}) {
+  return value === null || value === undefined ? "Unknown" : new Intl.NumberFormat("en", options).format(value);
 }
 
 function formatTime(value?: string, timezone?: string) {
@@ -25,9 +28,12 @@ function formatTime(value?: string, timezone?: string) {
   }).format(new Date(value));
 }
 
-function formatPercent(value: number) {
-  return `${formatNumber(value * 100, { maximumFractionDigits: 1 })}%`;
+function formatPercent(value: number | null) {
+  return value === null ? "No samples" : `${formatNumber(value * 100, { maximumFractionDigits: 1 })}%`;
 }
+
+function formatDuration(value: number | null | undefined) { return value == null ? "Unknown" : `${formatNumber(value)} ms`; }
+function formatCost(value: number | null, status: string) { return value === null ? status.replaceAll("_", " ") : `$${value.toFixed(6)}`; }
 
 function eventDetail(event: RuntimeEvent) {
   const detail = event.payload.detail ?? event.payload.reason ?? event.payload.count ?? event.payload.action;
@@ -95,16 +101,17 @@ function Cockpit(props: { snapshot: RuntimeSnapshot; onRunNow: () => void; isRun
 }
 
 function Metrics(props: { snapshot: RuntimeSnapshot }) {
-  const { metrics, latestRun } = props.snapshot;
+  const { metrics } = props.snapshot;
   return (
     <div className="metricGrid">
-      <MetricTile label="Success rate" value={formatPercent(metrics.successRate)} detail="Completed runs / terminal runs" tone="ok" />
-      <MetricTile label="P95 latency" value={`${formatNumber(metrics.p95LatencyMs)} ms`} detail="Latest projected runtime" tone={metrics.p95LatencyMs > 3000 ? "warn" : "live"} />
-      <MetricTile label="P50 latency" value={`${formatNumber(metrics.p50LatencyMs)} ms`} detail="Median span duration" tone="live" />
-      <MetricTile label="Cost" value={`$${metrics.costUsd.toFixed(4)}`} detail={`${metrics.inputTokens} in / ${metrics.outputTokens} out tokens`} />
-      <MetricTile label="Error rate" value={formatPercent(metrics.errorRate)} detail={`${latestRun?.errorCount ?? 0} errors in latest run`} tone={metrics.errorRate > 0 ? "bad" : "ok"} />
-      <MetricTile label="Tool failures" value={formatNumber(metrics.toolFailures)} detail={`${latestRun?.toolCallCount ?? 0} tool-like calls`} tone={metrics.toolFailures > 0 ? "bad" : "ok"} />
-      <MetricTile label="Eval pass rate" value={formatPercent(metrics.evalPassRate)} detail={`${props.snapshot.evals.length} gates reported`} tone="ok" />
+      <MetricTile label="Success rate" value={formatPercent(metrics.successRate)} detail={`${metrics.completedRuns} / ${metrics.terminalRuns} terminal runs, 24h live`} />
+      <MetricTile label="Run P95" value={formatDuration(metrics.runLatency.p95Ms)} detail={`${metrics.runLatency.samples} run samples, 24h live`} />
+      <MetricTile label="Run P50" value={formatDuration(metrics.runLatency.p50Ms)} detail={`${metrics.runLatency.samples} run samples, nearest rank`} />
+      <MetricTile label="Tool P95" value={formatDuration(metrics.toolLatency.p95Ms)} detail={`${metrics.toolLatency.samples} tool samples, 24h live`} />
+      <MetricTile label="Estimated cost" value={formatCost(metrics.costUsd, metrics.accounting.costStatus)} detail={metrics.accounting.costStatus === "partial" ? `$${metrics.accounting.knownCostUsd.toFixed(6)} known; ${metrics.accounting.unknownCostCalls} unknown calls` : `${formatNumber(metrics.inputTokens)} in / ${formatNumber(metrics.outputTokens)} out, 24h live`} />
+      <MetricTile label="Error rate" value={formatPercent(metrics.errorRate)} detail={`${metrics.failedRuns} failed / ${metrics.terminalRuns} terminal runs, 24h`} tone={metrics.errorRate !== null && metrics.errorRate > 0 ? "bad" : undefined} />
+      <MetricTile label="Tool failures" value={formatNumber(metrics.toolFailures)} detail={`${metrics.toolCalls} observed tool calls, 24h live`} tone={metrics.toolFailures > 0 ? "bad" : undefined} />
+      <MetricTile label="Eval pass rate" value={formatPercent(metrics.evalPassRate)} detail={`${metrics.evalReports} latest non-skipped reports`} />
     </div>
   );
 }
@@ -119,7 +126,7 @@ function Steps(props: { steps: RuntimeStep[] }) {
             <strong>{step.name}</strong>
             <small>{step.detail}</small>
           </div>
-          <span className="duration">{formatNumber(step.durationMs ?? 0)} ms</span>
+          <span className="duration">{formatDuration(step.durationMs)}</span>
         </li>
       ))}
     </ol>
@@ -149,8 +156,8 @@ function TraceTable(props: { spans: RuntimeSpan[] }) {
                 <small>{span.traceId} · {span.spanId}</small>
               </td>
               <td><span className={`statusPill ${statusClass(span.status)}`}>{span.status}</span></td>
-              <td>{formatNumber(span.durationMs)} ms</td>
-              <td>${(span.costUsd ?? 0).toFixed(4)}</td>
+              <td>{formatDuration(span.durationMs)}</td>
+              <td>{formatCost(span.costUsd, span.costStatus)}</td>
             </tr>
           ))}
         </tbody>
@@ -241,8 +248,8 @@ function Security(props: { snapshot: RuntimeSnapshot }) {
   return (
     <div className="securityGrid">
       <MetricTile label="Tool policy" value={security.toolPolicy.replace("_", " ")} detail={security.approvals.replaceAll("_", " ")} tone="ok" />
-      <MetricTile label="Secret scan" value={security.secretScan} detail="Responses and events are redacted" tone={security.secretScan === "passed" ? "ok" : "bad"} />
-      <MetricTile label="Sandbox" value={security.sandbox} detail="High-risk actions require review" tone={security.sandbox === "enabled" ? "ok" : "warn"} />
+      <MetricTile label="Secret scan" value={security.secretScan.replaceAll("_", " ")} detail="Latest recorded scan" tone={security.secretScan === "failed" ? "bad" : undefined} />
+      <MetricTile label="Sandbox" value={security.sandbox.replaceAll("_", " ")} detail="No OS isolation attestation" tone="warn" />
       <div className="denialBox">
         <h3>Recent denials</h3>
         {security.denials.map((denial) => (
@@ -279,6 +286,22 @@ function EmptyState(props: { title: string; detail: string }) {
   );
 }
 
+function RunTrace({ runId }: { runId: string }) {
+  const [open, setOpen] = useState(false);
+  const trace = useQuery({ queryKey: ["runtime-trace", runId], queryFn: () => fetchTrace(runId), enabled: open, refetchInterval: open ? 10_000 : false });
+  const download = useMutation({ mutationFn: () => fetchTrace(runId), onSuccess: (data) => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a"); link.href = url; link.download = `${data.runId}-trace.json`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } });
+  return <details className="executionDetail" onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary>Run trace</summary>
+    <button className="iconButton" aria-label="Export trace" title="Export trace" disabled={download.isPending} onClick={() => download.mutate()}><Download size={18} aria-hidden="true" /></button>
+    {trace.isError || download.isError ? <p role="alert">{(trace.error ?? download.error)?.message}</p> : null}
+    {trace.isPending ? <p role="status">Loading trace...</p> : trace.data?.spans.length ? <TraceTable spans={trace.data.spans} /> : <p>No trace recorded</p>}
+    {trace.data?.omittedFromOtlp.length ? <p>{trace.data.omittedFromOtlp.length} spans without an exportable end time</p> : null}
+  </details>;
+}
+
 function RunHistory({ canOperate }: { canOperate: boolean }) {
   const client = useQueryClient();
   const cancel = useMutation({ mutationFn: cancelRun, onSuccess: async () => { await client.invalidateQueries({ queryKey: ["runtime-run"] }); await client.invalidateQueries({ queryKey: ["runtime-runs"] }); await client.invalidateQueries({ queryKey: snapshotKey }); } });
@@ -297,6 +320,9 @@ function RunHistory({ canOperate }: { canOperate: boolean }) {
     {detail.data ? <div aria-label="Historical run result">
       <p className="runIdentity">{detail.data.run.id}</p>
       <p>{detail.data.run.status} · {detail.data.result?.deliveredCount ?? 0} delivered</p>
+      <p>{detail.data.run.mode} · Cost: {formatCost(detail.data.run.costUsd, detail.data.run.accounting.costStatus)} · {formatNumber(detail.data.run.inputTokens)} input / {formatNumber(detail.data.run.outputTokens)} output tokens</p>
+      {detail.data.run.accounting.costStatus === "partial" ? <p>${detail.data.run.accounting.knownCostUsd.toFixed(6)} known; {detail.data.run.accounting.unknownCostCalls} calls with unknown cost</p> : null}
+      <RunTrace runId={detail.data.run.id} />
       {canOperate && ["queued", "running", "cancelling"].includes(detail.data.run.status) ? <button disabled={cancel.isPending || detail.data.run.status === "cancelling"} onClick={() => cancel.mutate(detail.data.run.id)}>{detail.data.run.status === "cancelling" ? "Cancelling..." : "Cancel run"}</button> : null}
       {cancel.isError ? <p role="alert">{cancel.error.message}</p> : null}
       {detail.data.result?.outcome === "no_new_items" ? <p role="status">No new items</p> : null}
@@ -384,6 +410,7 @@ export function App({ canOperate }: { canOperate: boolean }) {
       {scheduleMutation.isError ? <div className="alert">Schedule update failed: {scheduleMutation.error.message}</div> : null}
 
       <Metrics snapshot={data} />
+      <Monitoring canOperate={canOperate} runId={data.latestRun?.startedAt ? data.latestRun.id : undefined} />
 
       <div className="layoutGrid">
         <Card title="Runs">

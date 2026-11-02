@@ -35,7 +35,7 @@ for (const withEvidence of [false, true]) {
       ]);
       migrateSqliteDatabase(database);
       assert.deepEqual(database.sqlite.prepare("select * from run_content_results").all(), before);
-      assert.equal(database.sqlite.prepare("select * from schema_migrations").all().length, 7);
+      assert.equal(database.sqlite.prepare("select * from schema_migrations").all().length, 8);
       assert.deepEqual(database.sqlite.pragma("foreign_key_check"), []);
     } finally { database.sqlite.close(); }
   });
@@ -68,10 +68,31 @@ test("R3.5 unknown migration versions and changed checksums fail closed", () => 
   const database = createSqliteDatabase();
   try {
     migrateSqliteDatabase(database);
-    database.sqlite.prepare("insert into schema_migrations values (8, 'future', 'future', '2026-11-01')").run();
+    database.sqlite.prepare("insert into schema_migrations values (9, 'future', 'future', '2026-11-01')").run();
     assert.throws(() => migrateSqliteDatabase(database), /Unsupported/);
-    database.sqlite.prepare("delete from schema_migrations where version = 8").run();
+    database.sqlite.prepare("delete from schema_migrations where version = 9").run();
     database.sqlite.prepare("update schema_migrations set checksum = 'changed' where version = 2").run();
     assert.throws(() => migrateSqliteDatabase(database), /checksum mismatch/);
+  } finally { database.sqlite.close(); }
+});
+
+test("R7 v8 upgrade preserves v7 checksums and evidence and rolls back partial schema", () => {
+  const database = createSqliteDatabase();
+  try {
+    migrateSqliteDatabase(database);
+    database.sqlite.exec(`drop table worker_monitor_state; drop table worker_alert_state; drop table worker_alert_transitions; drop table runtime_prunes;
+      drop index runtime_failed_window; drop index runtime_delta_sequence; delete from schema_migrations where version=8;`);
+    const history = database.sqlite.prepare("select * from schema_migrations order by version").all();
+    database.sqlite.prepare("insert into runtime_events(id,run_id,type,source,severity,timestamp,payload_json) values ('evidence','run','run.started','fixture','info','2026-11-01T00:00:00Z','{}')").run();
+    const evidence = database.sqlite.prepare("select * from runtime_events").all();
+    database.sqlite.exec("create table worker_alert_transitions (fixture text)");
+    assert.throws(() => migrateSqliteDatabase(database), /already exists/);
+    assert.equal(database.sqlite.prepare("select 1 from sqlite_master where name='worker_monitor_state'").get(), undefined);
+    assert.deepEqual(database.sqlite.prepare("select * from schema_migrations order by version").all(), history);
+    database.sqlite.exec("drop table worker_alert_transitions");
+    migrateSqliteDatabase(database); migrateSqliteDatabase(database);
+    assert.deepEqual(database.sqlite.prepare("select * from schema_migrations where version<=7 order by version").all(), history);
+    assert.deepEqual(database.sqlite.prepare("select * from runtime_events").all(), evidence);
+    assert.equal(database.sqlite.prepare("select * from worker_monitor_state").all().length, 0);
   } finally { database.sqlite.close(); }
 });

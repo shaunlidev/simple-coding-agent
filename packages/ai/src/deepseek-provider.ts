@@ -54,7 +54,16 @@ const usageSchema = z.object({
   total_tokens: z.number().int().nonnegative(),
   prompt_cache_hit_tokens: z.number().int().nonnegative().optional(),
   prompt_cache_miss_tokens: z.number().int().nonnegative().optional(),
-}).refine((usage) => usage.total_tokens === usage.prompt_tokens + usage.completion_tokens, "usage totals are inconsistent");
+  prompt_tokens_details: z.object({ cached_tokens: z.number().int().nonnegative().optional() }).optional(),
+}).superRefine((usage, context) => {
+  if (usage.total_tokens !== usage.prompt_tokens + usage.completion_tokens) context.addIssue({ code: "custom", message: "usage totals are inconsistent" });
+  const nestedHit = usage.prompt_tokens_details?.cached_tokens;
+  const hit = usage.prompt_cache_hit_tokens ?? nestedHit;
+  const miss = usage.prompt_cache_miss_tokens;
+  if (usage.prompt_cache_hit_tokens !== undefined && nestedHit !== undefined && usage.prompt_cache_hit_tokens !== nestedHit) context.addIssue({ code: "custom", message: "cache usage fields disagree" });
+  if ((hit !== undefined && hit > usage.prompt_tokens) || (miss !== undefined && miss > usage.prompt_tokens)) context.addIssue({ code: "custom", message: "cache usage exceeds input tokens" });
+  if (hit !== undefined && miss !== undefined && hit + miss !== usage.prompt_tokens) context.addIssue({ code: "custom", message: "cache usage breakdown is inconsistent" });
+});
 const toolCallSchema = z.object({
   id: z.string().min(1), type: z.literal("function"),
   function: z.object({ name: z.string().min(1), arguments: z.string() }),
@@ -84,10 +93,11 @@ type DeepSeekChunk = z.infer<typeof chunkSchema>;
 
 function toUsage(usage: z.infer<typeof usageSchema> | null | undefined): Usage | undefined {
   if (!usage) return undefined;
+  const cacheHit = usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens;
   return {
     input: usage.prompt_tokens, output: usage.completion_tokens, totalTokens: usage.total_tokens,
-    ...(usage.prompt_cache_hit_tokens === undefined ? {} : { cacheReadInput: usage.prompt_cache_hit_tokens }),
-    ...(usage.prompt_cache_miss_tokens === undefined ? {} : { cacheWriteInput: usage.prompt_cache_miss_tokens }),
+    ...(cacheHit === undefined ? {} : { cacheReadInput: cacheHit }),
+    ...(usage.prompt_cache_miss_tokens === undefined ? {} : { cacheMissInput: usage.prompt_cache_miss_tokens }),
   };
 }
 
@@ -471,6 +481,9 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): P
     name: "DeepSeek",
     models: [model],
     stream(_model: Model, context: ProviderContext, streamOptions?: StreamOptions) {
+      const requestedLimit = streamOptions?.maxOutputTokens;
+      if (requestedLimit !== undefined) z.number().int().min(1).max(393216).parse(requestedLimit);
+      const maxOutputTokens = options.maxOutputTokens === undefined ? requestedLimit : requestedLimit === undefined ? options.maxOutputTokens : Math.min(options.maxOutputTokens, requestedLimit);
       const stream = createAssistantMessageEventStream();
 
       queueMicrotask(() => {
@@ -482,12 +495,13 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): P
             tools: toDeepSeekTools(context.tools),
             stream: options.stream === true,
             ...(options.stream === true ? { stream_options: { include_usage: true } } : {}),
-            ...(options.maxOutputTokens === undefined ? {} : { max_tokens: options.maxOutputTokens }),
+            ...(maxOutputTokens === undefined ? {} : { max_tokens: maxOutputTokens }),
             ...(options.responseFormat ? { response_format: { type: options.responseFormat } } : {}),
             ...(options.thinking === true ? {} : { thinking: { type: "disabled" } }),
             ...(toolChoice ? { tool_choice: toolChoice } : {}),
           };
           const apiKey = getApiKey(options);
+          streamOptions?.signal?.throwIfAborted();
           const response = await doFetch(`${baseUrl}/chat/completions`, {
             method: "POST",
             headers: {

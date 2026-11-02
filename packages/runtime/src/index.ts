@@ -7,6 +7,8 @@ export { readBrowserSource } from "./browser-source.js";
 import { contentEntities, contentIdentityKey, runContentResults, contentDeliveries, runReceipts, runRequests, createSqliteDatabase, evalReports, migrateSqliteDatabase, runtimeEvents, schedules, securityAudit, toolApprovals, type SqliteDatabase } from "@simple-coding-agent/db";
 import { RuntimeMemory, adjustContentRank } from "./memory.js";
 import { RuntimePractices } from "./practices.js";
+import { RuntimeTelemetry } from "./telemetry.js";
+import { projectRun, projectRuns, projectSpans, projectMetrics, exportTrace, type Accounting, type RuntimeMetrics } from "./observability.js";
 import { practiceSelection, validatePracticeQuotes } from "./practice-rules.js";
 export { practiceProposalSchema } from "./practices.js";
 export { adjustContentRank } from "./memory.js";
@@ -16,6 +18,9 @@ import { contentTaskSchema, contentCitationSchema, sourceReadSchema, type Conten
 import { nextRunAt, validateScheduleClock, parseScheduleDate, coalesceDue } from "./schedule-time.js";
 export { nextRunAt } from "./schedule-time.js";
 export { RuntimeScheduler, type SchedulerRunResult, type RuntimeSchedulerOptions } from "./scheduler.js";
+export { createTaskRuntime } from "./task-runtime.js";
+export { pruneRequestSchema } from "./retention.js";
+export type { WorkerHealth, MonitoringOptions } from "./monitoring.js";
 export { contentTaskSchema } from "./content-contract.js";
 export type { ContentTask, ContentTaskRecord } from "./content-contract.js";
 export { executeContentRun, type ContentProviderFactory } from "./content-agent.js";
@@ -33,12 +38,14 @@ export type RuntimeRun = {
   status: RunStatus;
   trigger: "manual" | "schedule" | "demo";
   title: string;
+  mode: "live" | "demo" | "unknown";
   startedAt?: string;
   completedAt?: string;
   durationMs?: number;
-  costUsd: number;
-  inputTokens: number;
-  outputTokens: number;
+  costUsd: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  accounting: Accounting;
   toolCallCount: number;
   errorCount: number;
 };
@@ -60,14 +67,17 @@ export type RuntimeSpan = {
   runId: string;
   parentId?: string;
   parentSpanId?: string;
-  type: "root" | "scheduler" | "tool" | "browser" | "memory" | "llm" | "eval" | "security" | "delivery";
+  type: "root" | "scheduler" | "tool" | "source" | "browser" | "memory" | "llm" | "eval" | "security" | "delivery";
   name: string;
-  status: "ok" | "error" | "denied";
+  status: "ok" | "error" | "denied" | "running" | "cancelled" | "interrupted" | "skipped";
   startedAt: string;
-  durationMs: number;
-  costUsd?: number;
-  inputTokens?: number;
-  outputTokens?: number;
+  endedAt?: string;
+  durationMs: number | null;
+  costUsd: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costStatus: Accounting["costStatus"];
+  usageStatus: Accounting["usageStatus"];
   summary: string;
   attributes: Record<string, string | number | boolean>;
 };
@@ -111,8 +121,8 @@ export type EvalReportInput = EvalGate & {
 
 export type SecurityPosture = {
   toolPolicy: "least_privilege";
-  secretScan: "passed" | "failed";
-  sandbox: "enabled" | "planned";
+  secretScan: "passed" | "failed" | "not_run";
+  sandbox: "not_configured";
   approvals: "required_for_high_risk";
   denials: Array<{ id: string; tool: string; reason: string; timestamp: string }>;
 };
@@ -128,18 +138,7 @@ export type RuntimeSnapshot = {
   schedules: RuntimeSchedule[];
   steps: RuntimeStep[];
   spans: RuntimeSpan[];
-  metrics: {
-    successRate: number;
-    p50LatencyMs: number;
-    p95LatencyMs: number;
-    costUsd: number;
-    inputTokens: number;
-    outputTokens: number;
-    errorRate: number;
-    toolFailures: number;
-    evalPassRate: number;
-    events: number;
-  };
+  metrics: RuntimeMetrics;
   memory: MemoryState;
   evals: EvalGate[];
   security: SecurityPosture;
@@ -196,11 +195,6 @@ export type ContentPipelineOptions = {
   network?: SafeNetwork;
   signal?: AbortSignal;
   maxItems?: number;
-  budget?: {
-    maxCostUsd?: number;
-    maxLatencyMs?: number;
-    onOverflow?: "throw" | "degrade";
-  };
 };
 
 export type MemoryEntryInput = {
@@ -294,97 +288,11 @@ function stepFromEvent(event: RuntimeEvent): RuntimeStep | undefined {
     status: completed ? "completed" : "running",
     startedAt: event.timestamp,
     completedAt: completed ? event.timestamp : undefined,
-    durationMs: Number(event.payload.durationMs ?? 0),
+    durationMs: typeof event.payload.durationMs === "number" ? event.payload.durationMs : undefined,
     detail: String(event.payload.detail ?? event.payload.count ?? event.type),
   };
 }
 
-function spanFromEvent(event: RuntimeEvent): RuntimeSpan | undefined {
-  const typeByEvent: Partial<Record<RuntimeEventType, RuntimeSpan["type"]>> = {
-    "scheduler.task_due": "scheduler",
-    "pipeline.fetch.completed": "browser",
-    "pipeline.clean.completed": "tool",
-    "pipeline.dedupe.completed": "tool",
-    "pipeline.rank.completed": "memory",
-    "pipeline.summarize.completed": "llm",
-    "delivery.created": "delivery",
-    "memory.preference.updated": "memory",
-    "eval.completed": "eval",
-    "security.policy.checked": "security",
-    "security.policy.denied": "security",
-  };
-  const spanType = typeByEvent[event.type];
-  if (!spanType) return undefined;
-  const traceId = traceIdForRun(event.runId);
-  const spanId = spanIdForEvent(event.id);
-  return {
-    id: `${event.id}-span`,
-    traceId,
-    spanId,
-    runId: event.runId,
-    parentId: `${event.runId}-root-span`,
-    parentSpanId: rootSpanIdForRun(event.runId),
-    type: spanType,
-    name: event.type,
-    status: event.type === "security.policy.denied" ? "denied" : event.severity === "error" || event.severity === "critical" ? "error" : "ok",
-    startedAt: event.timestamp,
-    durationMs: Number(event.payload.durationMs ?? 0),
-    costUsd: Number(event.payload.costUsd ?? 0),
-    inputTokens: Number(event.payload.inputTokens ?? 0),
-    outputTokens: Number(event.payload.outputTokens ?? 0),
-    summary: String(event.payload.detail ?? event.payload.reason ?? event.payload.count ?? "recorded"),
-    attributes: {
-      "agent.event_id": event.id,
-      "agent.event_type": event.type,
-      "agent.source": event.source,
-      "agent.severity": event.severity,
-      ...(event.type === "pipeline.summarize.completed" ? {
-        "llm.model": String(event.payload.model ?? "deepseek-compatible"),
-        "llm.input_tokens": Number(event.payload.inputTokens ?? 0),
-        "llm.output_tokens": Number(event.payload.outputTokens ?? 0),
-        "llm.cost_usd": Number(event.payload.costUsd ?? 0),
-      } : {}),
-    },
-  };
-}
-
-function traceIdForRun(runId: string): string {
-  return `trace-${contentHash(runId).toString(16).padStart(16, "0")}`;
-}
-
-function rootSpanIdForRun(runId: string): string {
-  return `span-${contentHash(`${runId}:root`).toString(16).padStart(8, "0")}`;
-}
-
-function spanIdForEvent(eventId: string): string {
-  return `span-${contentHash(eventId).toString(16).padStart(8, "0")}`;
-}
-
-function rootSpanFromRun(run: RuntimeRun, events: RuntimeEvent[]): RuntimeSpan {
-  const startedAt = run.startedAt ?? events[0]?.timestamp ?? new Date().toISOString();
-  const durationMs = run.durationMs ?? events.reduce((sum, event) => sum + Number(event.payload.durationMs ?? 0), 0);
-  return {
-    id: `${run.id}-root-span`,
-    traceId: traceIdForRun(run.id),
-    spanId: rootSpanIdForRun(run.id),
-    runId: run.id,
-    type: "root",
-    name: run.title,
-    status: run.status === "failed" ? "error" : "ok",
-    startedAt,
-    durationMs,
-    costUsd: run.costUsd,
-    inputTokens: run.inputTokens,
-    outputTokens: run.outputTokens,
-    summary: `${run.trigger} run ${run.status}`,
-    attributes: {
-      "agent.run_id": run.id,
-      "agent.task_id": run.taskId,
-      "agent.trigger": run.trigger,
-      "agent.status": run.status,
-    },
-  };
-}
 
 export type SQLiteRuntimeStoreOptions = {
   database?: SqliteDatabase;
@@ -399,6 +307,7 @@ export class SQLiteRuntimeStore {
   readonly network: SafeNetwork;
   readonly memory: RuntimeMemory;
   readonly practices: RuntimePractices;
+  readonly telemetry: RuntimeTelemetry;
 
   constructor(options: SQLiteRuntimeStoreOptions = {}) {
     this.redactor = createRedactor(options.secrets);
@@ -408,6 +317,7 @@ export class SQLiteRuntimeStore {
     catch (error) { if (!options.database) this.database.sqlite.close(); throw error; }
     this.memory = new RuntimeMemory(this);
     this.practices = new RuntimePractices(this);
+    this.telemetry = new RuntimeTelemetry(this);
   }
 
   async appendEvent(input: unknown): Promise<RuntimeEvent> {
@@ -428,6 +338,7 @@ export class SQLiteRuntimeStore {
       if (fingerprint(stored) !== fingerprint(event)) throw conflict("Event ID reused with different content");
       return stored;
     }
+    if (event.type.startsWith("observation.")) this.telemetry.validateEvent(event);
     if (event.type === "run.started" || event.type === "run.completed" || /^(agent\.|pipeline\.|source\.|delivery\.)/.test(event.type)) this.assertRunExecutable(event.runId);
     if (["run.queued", "run.started", "run.completed", "run.failed", "run.cancelled", "run.skipped", "run.cancel_requested"].includes(event.type)) {
       const lifecycle = this.database.db.select().from(runtimeEvents).where(eq(runtimeEvents.runId, event.runId)).all();
@@ -508,6 +419,14 @@ export class SQLiteRuntimeStore {
       const events = this.readEvents(runId);
       if (events.length === 0) return undefined;
       return { run: projectRun(runId, events), result: this.readRunResult(runId) ?? null, events, task: this.readRunTask(runId) ?? null, sources: this.readSourceResults(runId), memoryContext: this.memory.readContext(runId) ?? null };
+    })();
+  }
+
+  readTrace(runId: string) {
+    return this.database.sqlite.transaction(() => {
+      const events = this.readEvents(runId);
+      if (!events.some((event) => event.type === "run.queued" || event.type === "run.started")) return undefined;
+      return exportTrace(runId, projectSpans(projectRun(runId, events), events));
     })();
   }
 
@@ -777,7 +696,10 @@ export class SQLiteRuntimeStore {
       const admission = this.admitRun({ actor: input.actor, key: input.key, intent: { taskId: input.taskId, title: task.definition.title, trigger: input.trigger, requestTarget: input.requestTarget } });
       if (admission.created) {
         this.database.sqlite.prepare("insert into run_task_snapshots values (?, ?, ?)").run(admission.runId, task.revision, JSON.stringify(task.definition));
+        const began = performance.now();
+        const observation = this.telemetry.start(admission.runId, { mode: task.definition.mode, name: "capture memory", details: { kind: "memory", attributes: {} } });
         this.memory.capture(admission.runId, task.definition.instruction);
+        this.telemetry.complete(admission.runId, { operationId: observation.operationId, result: { state: "finished", outcome: "ok", endedAt: new Date().toISOString(), durationMs: performance.now() - began }, usage: { kind: "not_applicable" }, responseModel: null });
       }
       return admission;
     }).immediate();
@@ -906,7 +828,10 @@ export class SQLiteRuntimeStore {
         detail: delivered.length > 0 ? "New items committed to inbox" : "No new items; previously delivered content retained in this run",
       }));
       const failedSources = this.readSourceResults(runId).filter((source) => source.status === "failed").map((source) => source.sourceId);
-      this.writeEvent(this.createEvent(runId, "run.completed", { outcome, quality: failedSources.length ? "degraded" : "complete", failedSources, durationMs: Math.max(0, Date.now() - Date.parse(started.timestamp)) }));
+      const summary = [...events].reverse().find((event) => event.type === "pipeline.summarize.completed");
+      const summaryPayload = summary ? z.record(z.string(), z.json()).parse(JSON.parse(summary.payloadJson)) : undefined;
+      const budgetReason = summaryPayload?.method === "extractive_budget_fallback" && typeof summaryPayload.budgetReason === "string" ? summaryPayload.budgetReason : undefined;
+      this.writeEvent(this.createEvent(runId, "run.completed", { outcome, quality: failedSources.length || budgetReason ? "degraded" : "complete", failedSources, ...(budgetReason ? { budgetReason } : {}), durationMs: Math.max(0, Date.now() - Date.parse(started.timestamp)) }));
       const receipt = this.readRunResult(runId);
       if (!receipt) throw new Error("Committed run receipt is missing");
       return receipt;
@@ -949,34 +874,34 @@ export class SQLiteRuntimeStore {
     await runDemoAgent(this, { trigger: "demo", delayMs: 0 });
   }
 
-  async snapshot(): Promise<RuntimeSnapshot> {
+  async snapshot(now = new Date()): Promise<RuntimeSnapshot> {
     const [runtimeSchedules, memory, evals, audit] = await Promise.all([this.readSchedules(), this.readMemory(), this.listEvalReports(), this.listSecurityAudit()]);
     const { events, latestRun, runContentItems, receipt } = this.database.sqlite.transaction(() => {
       const events = this.readEvents();
-      const latestRun = projectRuns(events)[0];
+      const runs = projectRuns(events);
+      const latestRun = runs.find((run) => run.status === "running" || run.status === "cancelling") ?? runs[0];
       return { events, latestRun, runContentItems: latestRun ? this.readContentItems(latestRun.id) : [], receipt: latestRun ? this.readRunResult(latestRun.id) : undefined };
     })();
     const runEvents = latestRun ? events.filter((event) => event.runId === latestRun.id) : [];
-    const projectedSpans = runEvents.map(spanFromEvent).filter((span): span is RuntimeSpan => Boolean(span));
-    const spans = latestRun ? [rootSpanFromRun(latestRun, runEvents), ...projectedSpans] : projectedSpans;
+    const spans = latestRun ? projectSpans(latestRun, runEvents) : [];
     const stepsById = new Map<string, RuntimeStep>();
     for (const step of runEvents.map(stepFromEvent).filter((value): value is RuntimeStep => Boolean(value))) {
       stepsById.set(step.id, { ...stepsById.get(step.id), ...step });
     }
     return {
-      generatedAt: new Date().toISOString(),
+      generatedAt: now.toISOString(),
       agent: {
         name: "Personalized Content Agent",
-        status: latestRun?.status === "running" ? "running" : latestRun?.status === "failed" ? "failed" : "idle",
-        mode: runEvents.some((event) => event.type === "run.started" && (event.payload.mode === "demo" || event.payload.trigger === "demo")) ? "demo" : "local",
+        status: latestRun?.status === "running" || latestRun?.status === "cancelling" ? "running" : latestRun?.status === "failed" ? "failed" : "idle",
+        mode: latestRun?.mode === "demo" ? "demo" : "local",
       },
       latestRun,
       schedules: runtimeSchedules,
       steps: [...stepsById.values()],
       spans,
-      metrics: projectMetrics(events, latestRun, evals.length > 0 ? evals : defaultEvals()),
+      metrics: projectMetrics(events, evals, now),
       memory,
-      evals: evals.length > 0 ? evals : defaultEvals(),
+      evals,
       security: projectSecurity(audit),
       contentItems: runContentItems,
       pipeline: { ...projectPipeline(runEvents, runContentItems), ...(receipt ? { outcome: receipt.outcome, digest: receipt.digest } : {}) },
@@ -985,57 +910,6 @@ export class SQLiteRuntimeStore {
   }
 }
 
-function projectRuns(events: RuntimeEvent[]): RuntimeRun[] {
-  const runIds = [...new Set(events.filter((event) => event.type === "run.started" || event.type === "run.queued").map((event) => event.runId))].reverse();
-  return runIds.map((runId) => projectRun(runId, events.filter((event) => event.runId === runId)));
-}
-
-function projectRun(runId: string, events: RuntimeEvent[]): RuntimeRun {
-  const started = events.find((event) => event.type === "run.started");
-  const requested = started ?? events.find((event) => event.type === "run.queued");
-  const completed = [...events].reverse().find((event) => ["run.completed", "run.failed", "run.cancelled", "run.skipped"].includes(event.type));
-  const status: RunStatus = completed?.type === "run.completed" ? "completed" : completed?.type === "run.failed" ? "failed" : completed?.type === "run.cancelled" ? "cancelled" : completed?.type === "run.skipped" ? "skipped" : events.some((event) => event.type === "run.cancel_requested") ? "cancelling" : started ? "running" : "queued";
-  const costUsd = events.reduce((sum, event) => sum + Number(event.payload.costUsd ?? 0), 0);
-  const inputTokens = events.reduce((sum, event) => sum + Number(event.payload.inputTokens ?? 0), 0);
-  const outputTokens = events.reduce((sum, event) => sum + Number(event.payload.outputTokens ?? 0), 0);
-  return {
-    id: runId,
-    taskId: String(requested?.payload.taskId ?? "content"),
-    title: String(requested?.payload.title ?? "Content run"),
-    trigger: z.enum(["manual", "schedule", "demo"]).parse(requested?.payload.trigger ?? "manual"),
-    status,
-    startedAt: started?.timestamp,
-    completedAt: completed?.timestamp,
-    durationMs: Number(completed?.payload.durationMs ?? 0),
-    costUsd,
-    inputTokens,
-    outputTokens,
-    toolCallCount: events.filter((event) => event.type.startsWith("pipeline.") || event.type === "delivery.created").length,
-    errorCount: events.filter((event) => event.severity === "error" || event.severity === "critical").length,
-  };
-}
-
-function projectMetrics(events: RuntimeEvent[], latestRun: RuntimeRun | undefined, evals: EvalGate[]): RuntimeSnapshot["metrics"] {
-  const completedRuns = new Set(events.filter((event) => event.type === "run.completed").map((event) => event.runId));
-  const failedRuns = new Set(events.filter((event) => event.type === "run.failed").map((event) => event.runId));
-  const totalRuns = completedRuns.size + failedRuns.size;
-  const passCount = evals.filter((gate) => gate.status === "passed").length;
-  const durations = events.map((event) => Number(event.payload.durationMs ?? 0)).filter((value) => value > 0).sort((left, right) => left - right);
-  const percentile = (p: number) => durations.length === 0 ? 0 : durations[Math.min(durations.length - 1, Math.floor((durations.length - 1) * p))] ?? 0;
-  const toolFailures = events.filter((event) => (event.type.startsWith("pipeline.") || event.type === "delivery.created" || event.type === "security.policy.denied") && (event.severity === "error" || event.severity === "critical" || event.type === "security.policy.denied")).length;
-  return {
-    successRate: totalRuns === 0 ? 1 : completedRuns.size / totalRuns,
-    p50LatencyMs: percentile(0.5),
-    p95LatencyMs: percentile(0.95) || (latestRun?.durationMs ?? 0),
-    costUsd: latestRun?.costUsd ?? 0,
-    inputTokens: latestRun?.inputTokens ?? 0,
-    outputTokens: latestRun?.outputTokens ?? 0,
-    errorRate: events.length === 0 ? 0 : events.filter((event) => event.severity === "error" || event.severity === "critical").length / events.length,
-    toolFailures,
-    evalPassRate: evals.length === 0 ? 0 : passCount / evals.length,
-    events: events.length,
-  };
-}
 
 function projectPipeline(events: RuntimeEvent[], items: DeliveredContentItem[]): RuntimeSnapshot["pipeline"] {
   const latest = (type: RuntimeEventType) => [...events].reverse().find((event) => event.type === type);
@@ -1196,6 +1070,8 @@ export async function runContentPipeline(store: SQLiteRuntimeStore, runId: strin
   }
   options = { ...options, network: options.network ?? store.network };
   const sources = options.sources ?? defaultContentSources();
+  store.telemetry.context(runId, sources.some((source) => source.kind === "mock") ? "demo" : "live");
+  const fetchBegan = performance.now();
   const emit = async (type: RuntimeEventType, payload: Record<string, unknown>, eventOptions?: { severity?: Severity }) => {
     await store.appendEvent(store.createEvent(runId, type, payload, { source: "content-pipeline", severity: eventOptions?.severity }));
   };
@@ -1215,35 +1091,19 @@ export async function runContentPipeline(store: SQLiteRuntimeStore, runId: strin
     await emit("run.failed", { reason: "sources_failed", detail }, { severity: "error" });
     throw new Error(detail);
   }
-  await emit("pipeline.fetch.completed", { count: fetched.length, failedSources, durationMs: 420, detail: `Fetched ${fetched.length} candidate items` });
+  await emit("pipeline.fetch.completed", { count: fetched.length, failedSources, durationMs: performance.now() - fetchBegan, detail: `Fetched ${fetched.length} candidate items` });
+  const cleanBegan = performance.now();
   const cleaned = fetched.map(cleanContent).filter((item) => item.title && item.text);
-  await emit("pipeline.clean.completed", { count: cleaned.length, durationMs: 90, detail: "Normalized titles, text, and URLs" });
+  await emit("pipeline.clean.completed", { count: cleaned.length, durationMs: performance.now() - cleanBegan, detail: "Normalized titles, text, and URLs" });
+  const dedupeBegan = performance.now();
   const unique = dedupeContent(cleaned);
-  await emit("pipeline.dedupe.completed", { count: unique.length, removed: cleaned.length - unique.length, durationMs: 70, detail: "Canonical URL and similarity dedupe" });
+  await emit("pipeline.dedupe.completed", { count: unique.length, removed: cleaned.length - unique.length, durationMs: performance.now() - dedupeBegan, detail: "Canonical URL and similarity dedupe" });
+  const rankBegan = performance.now();
   const memory = { profile: await store.readMemory(), feedback: store.memory.feedback() };
   const ranked = unique.map((item) => rankContent(item, memory, store.contentId(item))).sort((left, right) => right.score - left.score);
-  await emit("pipeline.rank.completed", { count: ranked.length, durationMs: 140, detail: "Preference and evidence weighted ranking" });
-  const estimatedLlm = { durationMs: 860, inputTokens: 2380, outputTokens: 640, costUsd: 0.0029, model: "deepseek-compatible" };
-  const overflowReasons = [
-    ...(options.budget?.maxCostUsd !== undefined && estimatedLlm.costUsd > options.budget.maxCostUsd ? [`cost ${estimatedLlm.costUsd} > ${options.budget.maxCostUsd}`] : []),
-    ...(options.budget?.maxLatencyMs !== undefined && estimatedLlm.durationMs > options.budget.maxLatencyMs ? [`latency ${estimatedLlm.durationMs} > ${options.budget.maxLatencyMs}`] : []),
-  ];
-  if (overflowReasons.length > 0 && options.budget?.onOverflow !== "degrade") {
-    await emit("run.failed", { reason: "budget_overflow", detail: `Budget overflow: ${overflowReasons.join(", ")}` }, { severity: "error" });
-    throw new Error(`Budget overflow: ${overflowReasons.join(", ")}`);
-  }
-  const degraded = overflowReasons.length > 0 && options.budget?.onOverflow === "degrade";
-  const delivered = ranked.map((item) => ({ ...item, runId, createdAt: new Date().toISOString(), summary: degraded ? item.title : item.summary }));
-  await emit("pipeline.summarize.completed", {
-    count: delivered.length,
-    durationMs: degraded ? 0 : estimatedLlm.durationMs,
-    inputTokens: degraded ? 0 : estimatedLlm.inputTokens,
-    outputTokens: degraded ? 0 : estimatedLlm.outputTokens,
-    costUsd: degraded ? 0 : estimatedLlm.costUsd,
-    model: estimatedLlm.model,
-    degraded,
-    detail: degraded ? `Budget overflow degraded summary: ${overflowReasons.join(", ")}` : "Extractive structured summaries created",
-  }, { severity: degraded ? "warning" : "info" });
+  await emit("pipeline.rank.completed", { count: ranked.length, durationMs: performance.now() - rankBegan, detail: "Preference and evidence weighted ranking" });
+  const delivered = ranked.map((item) => ({ ...item, runId, createdAt: new Date().toISOString() }));
+  await emit("pipeline.summarize.completed", { count: delivered.length, method: "extractive", detail: "Deterministic extracts; no model invocation" });
   options.signal?.throwIfAborted();
   return store.commitContentRun({ runId, items: delivered, maxItems: options.maxItems ?? 5 }).items;
 }
@@ -1263,48 +1123,15 @@ function defaultSchedules(now: string): RuntimeSchedule[] {
   ];
 }
 
-function defaultEvals(): EvalGate[] {
-  return [
-    { id: "runtime-event-replay", name: "Run can be reconstructed from events", status: "passed", score: 1, evidence: "SQLite runtime_events replay" },
-    { id: "memory-feedback-ranking", name: "Feedback changes ranking", status: "passed", score: 1, evidence: "SQLite memory and feedback tables" },
-    { id: "security-secret-redaction", name: "Secrets are not exposed in events", status: "passed", score: 1, evidence: "secret scan" },
-    { id: "tool-call-order", name: "Pipeline calls tools in expected order", status: "passed", score: 1, evidence: "trace spans" },
-  ];
-}
-
-function defaultSecurity(): SecurityPosture {
-  return {
-    toolPolicy: "least_privilege",
-    secretScan: "passed",
-    sandbox: "enabled",
-    approvals: "required_for_high_risk",
-    denials: [
-      {
-        id: "deny-bulk-post",
-        tool: "social_post_publish",
-        reason: "High-impact write action requires approval; current demo only permits read-only collection.",
-        timestamp: "2026-08-25T09:35:00.000Z",
-      },
-    ],
-  };
-}
-
 function projectSecurity(audit: SecurityAuditRecord[]): SecurityPosture {
-  const base = defaultSecurity();
-  const denials = audit
-    .filter((record) => record.severity === "warning" || record.severity === "error" || record.severity === "critical")
-    .slice(-20)
-    .reverse()
-    .map((record) => ({
-      id: record.id,
-      tool: record.action,
-      reason: record.message,
-      timestamp: record.createdAt,
-    }));
+  const scan = [...audit].reverse().find((record) => record.action === "secret_scan");
   return {
-    ...base,
-    secretScan: audit.some((record) => record.action === "secret_scan" && record.severity !== "info") ? "failed" : "passed",
-    denials: denials.length > 0 ? denials : base.denials,
+    toolPolicy: "least_privilege", secretScan: scan ? scan.severity === "info" ? "passed" : "failed" : "not_run",
+    sandbox: "not_configured", approvals: "required_for_high_risk",
+    denials: audit.filter((record) => {
+      try { return z.object({ decision: z.literal("denied") }).safeParse(JSON.parse(record.message)).success; }
+      catch { return record.action.includes("denied"); }
+    }).slice(-20).reverse().map((record) => ({ id: record.id, tool: record.action, reason: record.message, timestamp: record.createdAt })),
   };
 }
 

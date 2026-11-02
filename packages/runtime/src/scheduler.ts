@@ -5,6 +5,7 @@ import { z } from "zod";
 import { createSqliteDatabase, type SqliteDatabase } from "@simple-coding-agent/db";
 import { runDemoAgent, type SQLiteRuntimeStore, type RuntimeSchedule, type RuntimeEventType } from "./index.js";
 import { coalesceDue } from "./schedule-time.js";
+import { RuntimeMonitoring, type MonitoringOptions, type WorkerPhase } from "./monitoring.js";
 
 const jobSchema = z.object({
   seq: z.number().int(), run_id: z.string(), scope_key: z.string(), request_target: z.string(),
@@ -25,6 +26,7 @@ export type RuntimeSchedulerOptions = {
   runtime: SQLiteRuntimeStore;
   runAgent?: (input: { runId: string; signal: AbortSignal }) => Promise<string>;
   now?: () => Date;
+  monitoring?: MonitoringOptions;
 };
 
 export class RuntimeScheduler {
@@ -33,10 +35,21 @@ export class RuntimeScheduler {
   private stopping = false;
   private timer: ScheduledTask | undefined;
   private active: { runId: string; controller: AbortController; completion: Promise<void> } | undefined;
-  constructor(private readonly options: RuntimeSchedulerOptions) {}
+  private phase: WorkerPhase = "unowned";
+  private shutdownPromise: Promise<void> | undefined;
+  readonly monitoring: RuntimeMonitoring;
+  constructor(private readonly options: RuntimeSchedulerOptions) { this.monitoring = new RuntimeMonitoring(options.runtime, options.monitoring); }
   private get store() { return this.options.runtime; }
   private get sql() { return this.store.database.sqlite; }
   private now() { return this.options.now?.() ?? new Date(); }
+  private held() { return this.owned && (!this.lock || (this.lock.sqlite.open && this.lock.sqlite.inTransaction)); }
+  private fault(code: string): void {
+    if (this.phase === "stopped") return;
+    if (this.phase !== "draining") this.phase = "faulted";
+    this.stopping = true;
+    this.timer?.destroy(); this.timer = undefined;
+    this.active?.controller.abort(new Error(code));
+  }
 
   listJobs(): Job[] { return this.sql.prepare("select * from scheduled_jobs order by seq").all().map((row) => jobSchema.parse(row)); }
   private event(runId: string, type: RuntimeEventType, payload: Record<string, unknown>, now = this.now()) {
@@ -46,7 +59,8 @@ export class RuntimeScheduler {
   private own(): void {
     if (this.stopping) throw conflict("Worker is stopping");
     if (this.owned) {
-      if (this.lock && (!this.lock.sqlite.open || !this.lock.sqlite.inTransaction)) throw conflict("Worker ownership lock was lost");
+      if (!this.held()) { this.fault("worker_lock_lost"); throw conflict("Worker ownership lock was lost"); }
+      this.monitoring.assertReady();
       return;
     }
     if (this.sql.name === ":memory:" || this.sql.name === "") {
@@ -79,8 +93,12 @@ export class RuntimeScheduler {
           this.sql.prepare("update scheduled_jobs set state = ?, started_at = ?, finished_at = ? where run_id = ?").run(detail.run.status, detail.run.startedAt ?? null, detail.run.completedAt ?? null, runId);
           if (detail.run.status === "queued" && !detail.task) this.event(runId, "run.failed", { reason: "worker_interrupted_legacy", detail: "Legacy queued request has no frozen task" });
         }
+        const unfinished = this.sql.prepare("select distinct s.run_id from runtime_events s where s.type='observation.started' and not exists (select 1 from runtime_events c where c.id='observation-complete:' || json_extract(s.payload_json, '$.operationId'))").all();
+        for (const row of unfinished) this.store.telemetry.interruptOpen(z.object({ run_id: z.string() }).parse(row).run_id, this.now().toISOString());
         for (const job of this.listJobs()) {
-          if (job.state === "running" || job.state === "cancelling") this.event(job.run_id, job.state === "cancelling" ? "run.cancelled" : "run.failed", { reason: job.state === "cancelling" ? job.reason : "worker_interrupted", detail: "Previous execution ended without a terminal commit; it was not retried" });
+          if (job.state === "running" || job.state === "cancelling") {
+            this.event(job.run_id, job.state === "cancelling" ? "run.cancelled" : "run.failed", { reason: job.state === "cancelling" ? job.reason : "worker_interrupted", detail: "Previous execution ended without a terminal commit; it was not retried" });
+          }
         }
         const legacy = this.sql.prepare(`select distinct run_id from runtime_events e where e.type in ('run.queued','run.started')
           and not exists (select 1 from scheduled_jobs j where j.run_id = e.run_id)
@@ -89,30 +107,43 @@ export class RuntimeScheduler {
           const { run_id: runId } = z.object({ run_id: z.string() }).parse(row);
           const detail = this.store.readRunDetail(runId);
           if (detail?.run.status === "queued" && detail.task) this.insertJob(runId, `task:${detail.task.definition.id}`, `task:${detail.task.definition.id}`, undefined, detail.run.trigger, "recovered_queue");
-          else this.event(runId, "run.failed", { reason: "worker_interrupted_legacy", detail: "Legacy unfinished attempt cannot be safely resumed" });
+          else {
+            this.event(runId, "run.failed", { reason: "worker_interrupted_legacy", detail: "Legacy unfinished attempt cannot be safely resumed" });
+          }
         }
       }).immediate();
-    } catch (error) { this.release(); throw error; }
+      this.phase = "ready";
+      this.monitoring.bind({ inspect: () => ({ held: this.held(), phase: this.phase, activeRunId: this.active?.runId ?? null }), fault: (code) => this.fault(code) });
+    } catch (error) { this.fault("worker_start_failed"); this.release(); throw error; }
   }
 
   start(): void {
     this.own();
     if (this.timer) return;
     this.timer = cron.schedule("* * * * * *", () => this.tick().catch((error) => {
-      this.active?.controller.abort(error);
+      this.fault("scheduler_tick_failed");
       process.stderr.write(`scheduler tick failed: ${this.store.redactor.text(error instanceof Error ? error.message : "unknown error")}\n`);
     }), { timezone: "UTC", noOverlap: true });
     this.pump();
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> { return this.shutdownPromise ??= this.shutdown(); }
+
+  private async shutdown(): Promise<void> {
     this.stopping = true;
+    this.phase = "draining";
     this.timer?.destroy(); this.timer = undefined;
     const active = this.active;
-    if (active && this.sql.open) this.requestCancellation(active.runId, "server_shutdown", "worker");
+    const failures: unknown[] = [];
+    try { if (active && this.sql.open) this.requestCancellation(active.runId, "server_shutdown", "worker"); }
+    catch (error) { failures.push(error); }
     active?.controller.abort(new Error("Worker shutting down"));
-    await active?.completion;
-    this.release();
+    // A persistence failure is not permission to release an executor that has not drained.
+    try { await active?.completion; } catch (error) { failures.push(error); }
+    this.phase = "stopped";
+    try { this.monitoring.disposeAfterDrain(); } catch (error) { failures.push(error); }
+    try { this.release(); } catch (error) { failures.push(error); }
+    if (failures.length) throw new AggregateError(failures, "Worker shutdown failed", { cause: failures[0] });
   }
 
   private release() {
@@ -180,6 +211,8 @@ export class RuntimeScheduler {
     taskId ??= schedule?.taskId;
     const scope = taskId ? `task:${taskId}` : schedule ? `schedule:${schedule.id}` : "demo";
     const admission = taskId ? this.store.admitContentRun({ ...identity, taskId, trigger, requestTarget: target }) : this.store.admitRun({ ...identity, intent: { taskId: schedule?.id ?? "manual-content", title: schedule?.title ?? "Content run", trigger, requestTarget: target } });
+    const began = performance.now();
+    const observation = this.store.telemetry.start(admission.runId, { mode: this.store.readRunTask(admission.runId)?.definition.mode ?? "demo", name: "enqueue run", details: { kind: "scheduler", attributes: { trigger, target } } });
     const older = this.sql.prepare("select * from scheduled_jobs where scope_key = ? and state in ('queued','running','cancelling') order by seq").all(scope).map((row) => jobSchema.parse(row));
     const policy = schedule?.overlapPolicy ?? "queue";
     const reason = older.length ? policy === "skip" ? "overlap_skip" : policy === "cancel_previous" ? "cancel_previous" : "overlap_queue" : trigger === "manual" ? "manual" : "due";
@@ -187,6 +220,7 @@ export class RuntimeScheduler {
     if (older.length && policy === "skip") this.event(admission.runId, "run.skipped", { reason });
     else if (older.length && policy === "cancel_previous") for (const job of older) this.requestCancellation(job.run_id, "cancel_previous", identity.actor);
     this.event(admission.runId, "scheduler.task_due", { ...(schedule ? { scheduleId: schedule.id } : {}), reason, trigger, ...(scheduledFor ? { scheduledFor } : {}) });
+    this.store.telemetry.complete(admission.runId, { operationId: observation.operationId, result: { state: "finished", outcome: "ok", endedAt: new Date().toISOString(), durationMs: performance.now() - began }, usage: { kind: "not_applicable" }, responseModel: null });
     return this.job(admission.runId);
   }
 
@@ -232,19 +266,28 @@ export class RuntimeScheduler {
     // Defer dispatch until active ownership is installed; completion always drains before the next job.
     const completion = Promise.resolve().then(async () => {
       try {
-        controller.signal.throwIfAborted();
-        if (this.options.runAgent) await this.options.runAgent({ runId: job.run_id, signal: controller.signal });
-        else await runDemoAgent(this.store, { runId: job.run_id, trigger: job.trigger, delayMs: 0, alreadyStarted: true, signal: controller.signal, emitSchedulerEvent: false });
-        const state = this.job(job.run_id).state;
-        if (state === "cancelling") this.event(job.run_id, "run.cancelled", { reason: this.job(job.run_id).reason });
-        else if (state === "running") this.event(job.run_id, "run.failed", { reason: "executor_missing_terminal", detail: "Executor returned without a terminal result" });
+        try {
+          this.own();
+          controller.signal.throwIfAborted();
+          if (this.options.runAgent) await this.options.runAgent({ runId: job.run_id, signal: controller.signal });
+          else await runDemoAgent(this.store, { runId: job.run_id, trigger: job.trigger, delayMs: 0, alreadyStarted: true, signal: controller.signal, emitSchedulerEvent: false });
+          const state = this.job(job.run_id).state;
+          if (state === "cancelling") this.event(job.run_id, "run.cancelled", { reason: this.job(job.run_id).reason });
+          else if (state === "running") this.event(job.run_id, "run.failed", { reason: "executor_missing_terminal", detail: "Executor returned without a terminal result" });
+        } catch (error) {
+          const state = this.job(job.run_id).state;
+          if (state === "running" || state === "cancelling") this.event(job.run_id, state === "cancelling" ? "run.cancelled" : "run.failed", { reason: state === "cancelling" ? this.job(job.run_id).reason : "execution_failed", detail: error instanceof Error ? error.message : "Execution failed" });
+        }
       } catch (error) {
-        const state = this.job(job.run_id).state;
-        if (state === "running" || state === "cancelling") this.event(job.run_id, state === "cancelling" ? "run.cancelled" : "run.failed", { reason: state === "cancelling" ? this.job(job.run_id).reason : "execution_failed", detail: error instanceof Error ? error.message : "Execution failed" });
-      } finally { this.active = undefined; if (!this.stopping) this.pump(); }
+        this.fault("worker_persistence_failed");
+        throw error;
+      } finally {
+        this.active = undefined;
+        if (!this.stopping) { try { this.pump(); } catch (error) { this.fault("worker_pump_failed"); throw error; } }
+      }
     });
     this.active = { runId: job.run_id, controller, completion };
-    void completion.catch((error) => { this.stopping = true; process.stderr.write(`Worker persistence failure: ${this.store.redactor.text(error instanceof Error ? error.message : "unknown")}\n`); });
+    void completion.catch((error) => { process.stderr.write(`Worker persistence failure: ${this.store.redactor.text(error instanceof Error ? error.message : "unknown")}\n`); });
   }
 
   async idle(): Promise<void> { while (this.active) await this.active.completion; }

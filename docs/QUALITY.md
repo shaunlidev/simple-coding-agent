@@ -28,8 +28,8 @@ The existing dashboard and deployment checks inspect build output and file text.
 | Legacy history completeness | R3 retains surviving rows and explicitly marks old receipts incomplete; previously discarded results cannot be recovered from count-only events | R3 evidence; R10 backup/release |
 | Real dashboard agent | R4 controlled UI/browser and actual DeepSeek/public-source gates passed at exact pushed SHA `1a5d677` | R4/R5 checkpoint evidence |
 | Schedule semantics | R5 timezone, durable queue, actual cancellation and process/UI gates pass at pushed SHA `6b99dfd` | R5/R6 evidence |
-| Memory and practices | R6 frozen model context, feedback ranking, actual preference history, reviewed practice activation/rollback, shared terminal state and UI/process gates pass; exact-commit checkpoint pending | R6 evidence |
-| Honest telemetry | Real content events now contain actual usage; legacy demo metrics/default eval and security projections still require replacement | R7, R9 |
+| Memory and practices | R6 frozen model context, feedback ranking, actual preference history, reviewed practice activation/rollback, shared terminal state and UI/process gates pass at pushed SHA `efa9779` | R6 evidence |
+| Honest telemetry | R7 accounting/budgets/spans, heartbeat/readiness/alerts and approved retention pass working-tree API/UI/process and frozen-tree gates. Bounded live usage matches wire responses. Clean exact-head commit/push verification is pending | R7, R9 |
 | User workflows | UI lacks the complete configuration, feedback, and inspection flows | R8 |
 | Release evidence | Browser, cloud, restart, backup, restore, and rollback gates remain unverified | R9, R10 |
 

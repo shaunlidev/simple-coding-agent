@@ -24,6 +24,8 @@ test("R5.2 queue preserves every run in FIFO order; retries and skip do not exec
     assert.deepEqual(started, [ids[0]]);
     assert.equal(await worker.runNow("schedule", { actor: "owner", key: "second" }), ids[1]);
     assert.equal(worker.listJobs().length, 3);
+    assert.equal(store.telemetry.operations(ids[1]).filter(({ start }) => start.details.kind === "scheduler").length, 1);
+    assert.ok(store.telemetry.operations(ids[1]).find(({ start }) => start.details.kind === "scheduler")?.completion);
     for (const id of ids) { gates.get(id)?.release(); await turn(); }
     await worker.idle();
     assert.deepEqual(started, ids);
@@ -77,6 +79,34 @@ test("R5.3 due admission and cursor advance roll back together; missed triggers 
     assert.equal((await store.listEvents()).find((event) => event.payload.occurrenceCount)?.payload.occurrenceCount, 7);
     assert.deepEqual(await worker.tick(new Date("2026-11-01T06:30:00Z")), []);
   } finally { await worker.stop(); store.database.sqlite.close(); }
+});
+
+test("R7 shutdown persistence failure still aborts, drains and only then releases ownership", { timeout: 5000 }, async () => {
+  const store = new SQLiteRuntimeStore(); const aborted = latch(); const cleanup = latch();
+  const worker = new RuntimeScheduler({ runtime: store, runAgent: async ({ signal }) => {
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => { aborted.release(); resolve(); }, { once: true }));
+    await cleanup.promise;
+    signal.throwIfAborted();
+    return "unreachable";
+  } });
+  const other = new RuntimeScheduler({ runtime: store });
+  let shutdown: Promise<void> | undefined;
+  try {
+    await worker.runNow();
+    store.database.sqlite.exec("create trigger fail_cancel before insert on runtime_events when new.type='run.cancel_requested' begin select raise(abort, 'cancel write fault'); end");
+    shutdown = worker.stop();
+    const observed = shutdown.catch((error: unknown) => error);
+    await aborted.promise;
+    await assert.rejects(other.tick(), /Another worker/);
+    cleanup.release();
+    const failure = await observed;
+    assert.ok(failure instanceof AggregateError);
+    assert.match(String(failure.cause), /cancel write fault/);
+    await other.tick();
+    assert.equal(other.listJobs()[0].state, "failed");
+  } finally {
+    cleanup.release(); await shutdown?.catch(() => undefined); await worker.stop().catch(() => undefined); await other.stop(); store.database.sqlite.close();
+  }
 });
 
 test("R5.3 a second worker is refused; graceful restart retains queued snapshots/order", async () => {

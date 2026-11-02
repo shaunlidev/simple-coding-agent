@@ -78,6 +78,12 @@ for (const [label, settings, ids, expected] of [
       assert.equal((await f.store.projectRun(f.runId)).status, "failed");
       assert.equal(f.store.readRunResult(f.runId), undefined);
       assert.deepEqual(f.store.database.sqlite.prepare("select count(*) as count from content_deliveries").get(), { count: 0 });
+      if (label === "unknown source") {
+        assert.equal(f.fetches(), 0);
+        const security = f.store.telemetry.operations(f.runId).find(({ start }) => start.details.kind === "security");
+        assert.ok(security?.completion?.result.state === "finished" && security.completion.result.outcome === "denied");
+        assert.equal(security.start.parentSpanId, f.store.telemetry.operations(f.runId).find(({ start }) => start.details.kind === "tool")?.start.spanId);
+      }
     } finally { f.store.database.sqlite.close(); }
   });
 }

@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDeepSeekProvider } from "../src/deepseek-provider.ts";
-import type { Provider } from "../src/types.ts";
+import type { Provider, StreamOptions } from "../src/types.ts";
 
 const usage = { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_cache_hit_tokens: 30, prompt_cache_miss_tokens: 70 };
 const choice = { finish_reason: "stop", message: { content: "actual response" } };
 const sse = (chunks: unknown[], done = true) => new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + (done ? "data: [DONE]\n\n" : ""));
 
-async function collect(provider: Provider) {
-  const stream = provider.stream(provider.models[0], { messages: [{ role: "user", content: "Return JSON" }] });
+async function collect(provider: Provider, options?: StreamOptions) {
+  const stream = provider.stream(provider.models[0], { messages: [{ role: "user", content: "Return JSON" }] }, options);
   const result = stream.result().catch((error: unknown) => error);
   const events = [];
   try {
@@ -24,7 +24,7 @@ async function collect(provider: Provider) {
 
 test("non-stream usage and response model metadata are preserved, missing usage stays unknown", async () => {
   const { message } = await collect(createDeepSeekProvider({ apiKey: "fixture", fetch: async () => Response.json({ model: "actual-model", choices: [choice], usage }) }));
-  assert.deepEqual(message.usage, { input: 100, output: 20, totalTokens: 120, cacheReadInput: 30, cacheWriteInput: 70 });
+  assert.deepEqual(message.usage, { input: 100, output: 20, totalTokens: 120, cacheReadInput: 30, cacheMissInput: 70 });
   assert.equal(message.model, "actual-model");
   assert.equal(message.provider, "deepseek");
   const absent = await collect(createDeepSeekProvider({ apiKey: "fixture", fetch: async () => Response.json({ choices: [choice] }) }));
@@ -84,6 +84,34 @@ test("malformed usage is rejected rather than becoming false metrics", async () 
   await assert.rejects(collect(createDeepSeekProvider({ apiKey: "fixture", fetch: async () => Response.json({ choices: [choice], usage: { ...usage, total_tokens: -1 } }) })), /usage|total_tokens/);
 });
 
+test("R7.1 cache accounting rejects inconsistent breakdowns on both provider paths", async () => {
+  const invalid = [
+    { ...usage, prompt_cache_hit_tokens: 101 },
+    { ...usage, prompt_cache_miss_tokens: 101 },
+    { ...usage, prompt_cache_hit_tokens: 20 },
+    { ...usage, prompt_tokens_details: { cached_tokens: 31 } },
+    { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_tokens_details: { cached_tokens: 101 } },
+  ];
+  for (const value of invalid) for (const stream of [false, true]) {
+    const provider = createDeepSeekProvider({ apiKey: "fixture", stream, fetch: async () => stream
+      ? sse([{ choices: [{ delta: { content: "actual response" }, finish_reason: "stop" }], usage: value }])
+      : Response.json({ choices: [choice], usage: value }) });
+    await assert.rejects(collect(provider), /cache|usage/i);
+  }
+});
+
+test("R7.1 documented nested cache usage is preserved without fabricating missing cache fields", async () => {
+  for (const stream of [false, true]) {
+    const value = { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_tokens_details: { cached_tokens: 30 } };
+    const { message } = await collect(createDeepSeekProvider({ apiKey: "fixture", stream, fetch: async () => stream
+      ? sse([{ choices: [{ delta: { content: "actual response" }, finish_reason: "stop" }], usage: value }])
+      : Response.json({ choices: [choice], usage: value }) }));
+    assert.equal(message.usage?.cacheReadInput, 30);
+    const absent = await collect(createDeepSeekProvider({ apiKey: "fixture", fetch: async () => Response.json({ choices: [choice], usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 } }) }));
+    assert.equal(absent.message.usage?.cacheReadInput, undefined);
+  }
+});
+
 test("output truncation during tool JSON preserves usage without emitting an executable tool", async () => {
   const { message, events } = await collect(createDeepSeekProvider({ apiKey: "fixture", stream: true, fetch: async () => sse([
     { choices: [{ delta: { tool_calls: [{ index: 0, id: "call", function: { name: "collect_source", arguments: '{"sourceId":' } }] }, finish_reason: "length" }], usage },
@@ -113,4 +141,27 @@ test("response byte caps cancel the body instead of accumulating unbounded outpu
   })) });
   await assert.rejects(collect(provider), /response.*limit/i);
   assert.equal(cancelled, true);
+});
+
+test("R7.4 governed output limits cannot raise the provider factory limit", async () => {
+  const sent: number[] = [];
+  const provider = createDeepSeekProvider({ apiKey: "fixture", maxOutputTokens: 128, fetch: async (_url, init) => {
+    sent.push(JSON.parse(String(init?.body)).max_tokens);
+    return Response.json({ choices: [choice], usage });
+  } });
+  await collect(provider, { maxOutputTokens: 64 });
+  await collect(provider, { maxOutputTokens: 256 });
+  assert.deepEqual(sent, [64, 128]);
+  await assert.rejects(collect(provider, { maxOutputTokens: 0 }));
+  assert.equal(sent.length, 2);
+});
+
+test("R7.4 cancellation during deferred preparation prevents actual provider transport", async () => {
+  let sends = 0;
+  const controller = new AbortController();
+  const provider = createDeepSeekProvider({ apiKey: "fixture", fetch: async () => { sends++; return Response.json({ choices: [choice], usage }); } });
+  const pending = collect(provider, { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, /abort/i);
+  assert.equal(sends, 0);
 });

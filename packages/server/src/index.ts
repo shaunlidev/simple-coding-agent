@@ -5,7 +5,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RuntimeScheduler, SQLiteRuntimeStore, contentTaskSchema, practiceProposalSchema, createContentExecutor, nextRunAt, type ContentProviderFactory, type RuntimeSchedule } from "@simple-coding-agent/runtime";
+import { SQLiteRuntimeStore, contentTaskSchema, practiceProposalSchema, createTaskRuntime, pruneRequestSchema, nextRunAt, type ContentProviderFactory, type RuntimeSchedule, type MonitoringOptions } from "@simple-coding-agent/runtime";
 import { SafeNetwork, createCloudflareResolver, createRedactor, evaluateToolCall, parseEnvironment, parseUrlAllowlist, redactSecrets, scanForSecrets } from "@simple-coding-agent/security";
 import { z } from "zod";
 import { parseAuthUsers, registerAuthentication } from "./auth.js";
@@ -20,6 +20,7 @@ export type AgentOpsServerOptions = {
   dashboardRoot?: string;
   providerFactory?: ContentProviderFactory;
   network?: SafeNetwork;
+  monitoring?: MonitoringOptions;
 };
 
 const createScheduleSchema = z.object({
@@ -82,6 +83,7 @@ function redactForResponse(value: unknown): unknown {
 
 async function sendSseSnapshot(reply: FastifyReply, runtime: SQLiteRuntimeStore, closeAfterFirst: boolean) {
   const snapshot = await runtime.snapshot();
+  if (reply.raw.writableEnded || reply.raw.destroyed) return;
   reply.raw.write(`event: snapshot\ndata: ${runtime.redactor.json(snapshot)}\n\n`);
   for (const event of snapshot.events.slice().reverse()) {
     reply.raw.write(`event: runtime-event\ndata: ${runtime.redactor.json(event)}\n\n`);
@@ -95,7 +97,6 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   const urlAllowlist = parseUrlAllowlist(env.AGENT_URL_ALLOWLIST);
   if (env.AGENT_DB_PATH !== ":memory:") mkdirSync(dirname(env.AGENT_DB_PATH), { recursive: true });
   const runtime = new SQLiteRuntimeStore({ path: env.AGENT_DB_PATH, network: options.network ?? new SafeNetwork({ allowlist: urlAllowlist, ...(env.AGENT_DNS_MODE === "cloudflare" ? { resolve: createCloudflareResolver() } : {}) }), secrets: [env.DEEPSEEK_API_KEY ?? "", env.AGENT_SESSION_SECRET ?? "", ...users.map((user) => user.secret)] });
-  const scheduler = new RuntimeScheduler({ runtime, now: options.now, runAgent: createContentExecutor(runtime, { env, providerFactory: options.providerFactory }) });
   const app = Fastify({
     logger: options.logger ? {
       ...(options.logStream ? { stream: options.logStream } : {}),
@@ -105,6 +106,18 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
     bodyLimit: 64 * 1024,
     trustProxy: env.AGENT_TRUST_PROXY === "1" ? "loopback" : false,
   });
+
+  try {
+  const taskRuntime = createTaskRuntime({ runtime, env, now: options.now, providerFactory: options.providerFactory, monitoring: options.monitoring });
+  const { scheduler, monitoring, retention } = taskRuntime;
+  const streams = new Set<() => Promise<void>>();
+  let shutdown: Promise<void> | undefined;
+  app.addHook("preClose", async () => {
+    shutdown ??= taskRuntime.close();
+    void shutdown.catch(() => undefined);
+    await Promise.all([...streams].map((close) => close()));
+  });
+  app.addHook("onClose", () => shutdown ?? taskRuntime.close());
 
   app.setErrorHandler((error, _request, reply) => {
     const candidate = error as { statusCode?: number };
@@ -123,6 +136,7 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
   await app.register(cors, { origin: env.AGENT_CORS_ORIGIN, credentials: true });
   const auth = await registerAuthentication(app, env, runtime, users);
   const executor = new GuardedToolExecutor({ runtime, tools: new Map([
+    ["telemetry_prune", { requiresApproval: true, parameters: pruneRequestSchema, execute: async (args, context) => retention.prune(context.actor, args) }],
     ["memory_clear", { requiresApproval: true, parameters: z.object({ confirmation: z.literal("clear-memory") }).strict(), execute: async (_args, context) => {
       await runtime.clearMemory(context.actor);
       for (const job of scheduler.listJobs()) if (job.state === "cancelling" && job.reason === "memory_cleared") scheduler.cancel(job.run_id, context.actor);
@@ -137,14 +151,28 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
 
   app.get("/healthz", async () => ({ ok: true }));
 
-  app.get("/readyz", async () => {
-    runtime.database.sqlite.prepare("select 1").get();
-    return { ok: true, database: "connected" };
+  app.get("/readyz", async (_request, reply) => {
+    const health = monitoring.read();
+    return reply.code(health.ready ? 200 : 503).send({ ok: health.ready, database: health.database,
+      worker: { phase: health.worker.phase, heartbeat: health.worker.heartbeat, locallyOwned: health.worker.locallyOwned },
+      monitor: { freshness: health.monitor.freshness }, reasons: health.reasons });
+  });
+
+  app.get("/api/monitoring", async () => ({ health: monitoring.read(), alerts: monitoring.alerts() }));
+  app.get("/api/monitoring/alerts", async (request) => {
+    const query = z.object({ after: z.coerce.number().int().min(0).default(0), limit: z.coerce.number().int().min(1).max(500).default(100) }).strict().parse(request.query);
+    return { alerts: monitoring.alerts(query.after, query.limit) };
   });
 
   app.get("/api/snapshot", async () => redactForResponse(await runtime.snapshot()));
 
   app.get("/api/runs", async () => ({ runs: await runtime.listRuns() }));
+
+  app.get("/api/runs/:id/trace", async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
+    const trace = runtime.readTrace(request.params.id);
+    if (!trace) return reply.code(404).send({ error: { code: "RUN_NOT_FOUND", message: "Run not found" } });
+    return redactForResponse(trace);
+  });
 
   app.get("/api/runs/:id", async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
     const detail = runtime.readRunDetail(request.params.id);
@@ -167,11 +195,6 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
         (!source || event.source === source),
       )),
     };
-  });
-
-  if (options.startScheduler) scheduler.start();
-  app.addHook("onClose", async () => {
-    await scheduler.stop();
   });
 
   function runRequest(request: FastifyRequest) {
@@ -242,15 +265,28 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
       "cache-control": "no-store",
       connection: once ? "close" : "keep-alive",
     });
-    await sendSseSnapshot(reply, runtime, once);
-    if (once) return reply;
-    const timer = setInterval(() => {
-      request.session.reload().then(async () => {
-        if (!auth.currentUser(request)) { clearInterval(timer); reply.raw.end(); return; }
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let pending: Promise<void> | undefined;
+    let ended = false;
+    const close = () => {
+      ended = true; clearInterval(timer); streams.delete(close);
+      if (!reply.raw.writableEnded) reply.raw.end();
+      return pending?.catch(() => undefined) ?? Promise.resolve();
+    };
+    streams.add(close);
+    request.raw.once("close", () => { void close(); });
+    try { pending = sendSseSnapshot(reply, runtime, once); await pending; }
+    catch (error) { void close(); throw error; }
+    finally { pending = undefined; }
+    if (once || ended) { void close(); return reply; }
+    timer = setInterval(() => {
+      if (pending || ended) return;
+      pending = request.session.reload().then(async () => {
+        if (ended) return;
+        if (!auth.currentUser(request)) { void close(); return; }
         await sendSseSnapshot(reply, runtime, false);
-      }).catch(() => { clearInterval(timer); reply.raw.end(); });
+      }).catch(() => { void close(); }).finally(() => { pending = undefined; });
     }, 1000);
-    request.raw.on("close", () => clearInterval(timer));
     return reply;
   });
 
@@ -448,5 +484,12 @@ export async function createAgentOpsServer(options: AgentOpsServerOptions = {}) 
     return await runtime.updateSchedule(request.params.id, parsed.data, options.now?.() ?? new Date());
   });
 
-  return { app, runtime, scheduler, database: runtime.database };
+  if (options.startScheduler) scheduler.start();
+  return { app, runtime, scheduler, monitoring, retention, database: runtime.database };
+  } catch (error) {
+    try { await app.close(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], "Server startup cleanup failed", { cause: error }); }
+    finally { if (runtime.database.sqlite.open) runtime.database.sqlite.close(); }
+    throw error;
+  }
 }

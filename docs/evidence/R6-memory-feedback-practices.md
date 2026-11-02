@@ -1,6 +1,6 @@
 # R6 Memory, Feedback And Practices
 
-Status: implementation and behavioral acceptance passed; clean commit verification and push pending.
+Status: accepted and pushed as `efa9779dc987a2057572a207b5c6e03231fba119`.
 
 ## Previous Checkpoint
 
@@ -39,7 +39,7 @@ duplicate implementation; workflow documents remain separate by design.
 - [x] R6-C: evidence-backed practice review, eval, activation and rollback.
 - [x] R6-D: CLI/TUI compatibility over the shared task/runtime state.
 - [x] API/browser/process verification, regression gates and evidence.
-- [ ] Independent commit, clean exact-head verification, push and remote SHA.
+- [x] Independent commit, clean exact-head verification, push and remote SHA.
 
 Each implementation unit gets its behavioral check before the next unit.
 The original stack and scope remain unchanged. Full Dashboard navigation and
@@ -312,3 +312,17 @@ Pre-commit gates on macOS arm64, bundled Node 24.22.1:
 
 These are pre-commit checks with `dirty:true`. The next checkpoint must record
 the clean exact SHA, rerun the gates, push and compare the remote SHA before R7.
+
+## Clean Checkpoint
+
+All listed local commands and R4/R5/R6 process/browser regression gates passed
+at `efa9779dc987a2057572a207b5c6e03231fba119`; the worktree was clean and R6
+reports record `dirty:false`. Full suite: 261 total, 259 reported pass, 2 skipped.
+Eval: 13 total, 11 reported pass, 2 skipped. No failures. Logs:
+`/private/tmp/agent-r6-exact-{build,tests,eval,ui,process,r4,r5-process,r5-ui}.log`.
+UI runs include `run-03050203-1254-420b-8d51-b3d58730496f` with practice
+`8f8360bd-8c29-4366-a13b-f9160555633e`; restarted terminal run:
+`run-0f721545-b98b-48a4-9dda-e51fe5f7415e`.
+`git push origin fix/agent-ops-acceptance` succeeded and `git ls-remote` returned
+the same full SHA. This closure note is recorded with the following R7 work,
+without amending the accepted checkpoint. R7-R10 remain unaccepted.

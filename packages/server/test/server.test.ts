@@ -38,7 +38,8 @@ test("server exposes health, readiness, and snapshot endpoints", async () => {
   const snapshot = await request({ method: "GET", url: "/api/snapshot" });
 
   assert.equal(health.statusCode, 200);
-  assert.equal(ready.statusCode, 200);
+  assert.equal(ready.statusCode, 503);
+  assert.equal(ready.json().worker.phase, "unowned");
   assert.equal(snapshot.statusCode, 200);
   assert.equal(JSON.parse(snapshot.body).agent.name, "Personalized Content Agent");
 

@@ -51,6 +51,37 @@ These use isolated SQLite, synthetic secrets and actual Chromium. The browser se
 
 ## Coverage
 
+R7 working-tree observability gate after building API and Dashboard:
+
+```bash
+node scripts/verify-observability-ui.mjs
+node scripts/verify-monitoring.mjs
+node scripts/verify-accounting-process.mjs
+```
+
+This runs controlled provider/transport data through actual Chromium collection,
+API, SQLite and Dashboard. It checks the hand-priced total, partial unknown usage,
+zero additional requests on low-budget denial, historical trace download and
+desktop/mobile containment. Reports under `artifacts/acceptance/R7/` distinguish
+controlled evidence and record SHA/dirty state. The monitoring gate starts real
+separate workers, pauses only the heartbeat writer, checks readiness/lock refusal,
+restores freshness, replaces the fenced owner and performs approved cleanup in
+Chromium at desktop/mobile sizes. It keeps SSE connected during graceful stop.
+Neither gate establishes live billing, an external collector or deployment.
+
+The accounting process gate kills a worker after actual controlled provider
+dispatch and before usage, then verifies frozen-price/unknown-exposure recovery
+with no retry. Optional real-provider accounting (paid, at most three turns and
+1024 output tokens per turn):
+
+```bash
+RUN_DEEPSEEK_LIVE=1 node --env-file-if-exists=.env scripts/verify-observability-live.mjs
+```
+
+This compares independently parsed wire usage with persisted facts, using a
+controlled source and no catalog. It proves usage preservation, not public-source
+quality or invoice accuracy. Missing opt-in/key exits 2 and produces no pass.
+
 R6 after building API and Dashboard:
 
 ```bash

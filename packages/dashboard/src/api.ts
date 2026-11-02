@@ -1,18 +1,28 @@
 export type RunStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled" | "skipped";
 export type StepStatus = "pending" | "running" | "completed" | "failed" | "skipped";
 
+export type Accounting = {
+  usageStatus: "reported" | "partial" | "unknown" | "not_applicable";
+  costStatus: "estimated" | "partial" | "unknown" | "not_applicable";
+  modelCalls: number; unknownUsageCalls: number; unknownCostCalls: number;
+  knownInputTokens: number; knownOutputTokens: number; knownCostUsd: number;
+};
+type Latency = { samples: number; p50Ms: number | null; p95Ms: number | null; method: "nearest_rank" };
+
 export type RuntimeRun = {
   id: string;
   taskId: string;
   status: RunStatus;
   trigger: "manual" | "schedule" | "demo";
   title: string;
+  mode: "live" | "demo" | "unknown";
   startedAt?: string;
   completedAt?: string;
   durationMs?: number;
-  costUsd: number;
-  inputTokens: number;
-  outputTokens: number;
+  costUsd: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  accounting: Accounting;
   toolCallCount: number;
   errorCount: number;
 };
@@ -34,14 +44,17 @@ export type RuntimeSpan = {
   runId: string;
   parentId?: string;
   parentSpanId?: string;
-  type: "root" | "scheduler" | "tool" | "browser" | "memory" | "llm" | "eval" | "security" | "delivery";
+  type: "root" | "scheduler" | "tool" | "source" | "browser" | "memory" | "llm" | "eval" | "security" | "delivery";
   name: string;
-  status: "ok" | "error" | "denied";
+  status: "ok" | "error" | "denied" | "running" | "cancelled" | "interrupted" | "skipped";
   startedAt: string;
-  durationMs: number;
-  costUsd?: number;
-  inputTokens?: number;
-  outputTokens?: number;
+  endedAt?: string;
+  durationMs: number | null;
+  costUsd: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costStatus: Accounting["costStatus"];
+  usageStatus: Accounting["usageStatus"];
   summary: string;
   attributes: Record<string, string | number | boolean>;
 };
@@ -89,8 +102,8 @@ export type EvalGate = {
 
 export type SecurityPosture = {
   toolPolicy: "least_privilege";
-  secretScan: "passed" | "failed";
-  sandbox: "enabled" | "planned";
+  secretScan: "passed" | "failed" | "not_run";
+  sandbox: "not_configured";
   approvals: "required_for_high_risk";
   denials: Array<{ id: string; tool: string; reason: string; timestamp: string }>;
 };
@@ -122,15 +135,13 @@ export type RuntimeSnapshot = {
   steps: RuntimeStep[];
   spans: RuntimeSpan[];
   metrics: {
-    successRate: number;
-    p50LatencyMs: number;
-    p95LatencyMs: number;
-    costUsd: number;
-    inputTokens: number;
-    outputTokens: number;
-    errorRate: number;
-    toolFailures: number;
-    evalPassRate: number;
+    window: { from: string; to: string; population: "live" };
+    successRate: number | null; errorRate: number | null;
+    terminalRuns: number; completedRuns: number; failedRuns: number; cancelledRuns: number;
+    runLatency: Latency; toolLatency: Latency; modelLatency: Latency;
+    costUsd: number | null; inputTokens: number | null; outputTokens: number | null;
+    accounting: Accounting; toolFailures: number; toolCalls: number;
+    evalPassRate: number | null; evalReports: number; evalScope: "latest_non_skipped_reports";
     events: number;
   };
   memory: MemoryState;
@@ -206,7 +217,7 @@ export async function runNow(key: string, taskId?: string): Promise<{ accepted: 
   return requestJson<{ accepted: true; runId: string }>("/api/runs/run-now", { method: "POST", headers: { "idempotency-key": key }, body: JSON.stringify(taskId ? { taskId } : {}) });
 }
 
-export type ContentTask = { id: string; title: string; instruction: string; model: string; mode?: "live" | "demo"; sources: { id: string; kind: "rss" | "url" | "browser" | "mock"; url: string; query?: string }[] };
+export type ContentTask = { id: string; title: string; instruction: string; model: string; mode?: "live" | "demo"; sources: { id: string; kind: "rss" | "url" | "browser" | "mock"; url: string; query?: string }[]; limits?: { maxCostUsd?: number; maxTotalTokens?: number; maxOutputTokens?: number; runTimeoutMs?: number; onBudgetOverflow?: "stop" | "extractive" } };
 export type ContentTaskRecord = { definition: ContentTask; revision: number; updatedAt: string };
 export const fetchTasks = () => requestJson<{ tasks: ContentTaskRecord[]; demoMode: boolean; defaultModel: string }>("/api/tasks");
 export const saveTask = (definition: ContentTask) => requestJson<ContentTaskRecord>(`/api/tasks/${encodeURIComponent(definition.id)}`, { method: "PUT", body: JSON.stringify({ definition, expectedRevision: 0 }) });
@@ -220,6 +231,7 @@ export type RunDetail = {
 
 export const fetchRuns = () => requestJson<{ runs: RuntimeRun[] }>("/api/runs");
 export const fetchRun = (id: string) => requestJson<RunDetail>(`/api/runs/${encodeURIComponent(id)}`);
+export const fetchTrace = (id: string) => requestJson<{ runId: string; spans: RuntimeSpan[]; omittedFromOtlp: { spanId: string; reason: string }[]; otlp: unknown }>(`/api/runs/${encodeURIComponent(id)}/trace`);
 export const cancelRun = (id: string) => requestJson<{ runId: string; status: RunStatus }>(`/api/runs/${encodeURIComponent(id)}/cancel`, { method: "POST", body: "{}" });
 export const createSchedule = (input: { id: string; taskId: string; title: string; cron: string; timezone: string; overlapPolicy: RuntimeSchedule["overlapPolicy"] }) => requestJson<RuntimeSchedule>("/api/schedules", { method: "POST", body: JSON.stringify(input) });
 export const runSchedule = (input: { id: string; key: string }) => requestJson<{ runId: string }>(`/api/schedules/${encodeURIComponent(input.id)}/run-now`, { method: "POST", headers: { "idempotency-key": input.key }, body: "{}" });
@@ -257,6 +269,18 @@ export const evaluatePractice = (id: string) => requestJson<PracticeList["evalua
 export const activatePractice = (input: { id: string; evaluationId: string; expectedRevision: number }) => requestJson(`/api/memory/practices/${encodeURIComponent(input.id)}/activate`, { method: "POST", body: JSON.stringify({ evaluationId: input.evaluationId, expectedRevision: input.expectedRevision, confirmation: "activate-practice" }) });
 export const rollbackPractice = (expectedRevision: number) => requestJson("/api/memory/practices/rollback", { method: "POST", body: JSON.stringify({ expectedRevision, confirmation: "rollback-practice" }) });
 export const requestMemoryClear = (runId: string) => requestJson<{ id: string }>("/api/security/approvals", { method: "POST", body: JSON.stringify({ runId, tool: "memory_clear", args: { confirmation: "clear-memory" } }) });
+export type MonitoringState = {
+  health: { ready: boolean; database: "connected" | "unavailable"; worker: { locallyOwned: boolean; session: string | null; phase: string; heartbeat: string; lastHeartbeatAt: string | null; activeRunId: string | null }; monitor: { freshness: string; lastPolledAt: string | null }; reasons: string[] };
+  alerts: Array<{ sequence: number; condition: string; generation: number; edge: "open" | "recovery"; observedAt: string; evidence: { session: string; ruleVersion: number; watermark: number; failedRuns: number; windowStart: string; heartbeat: string; phase: string; source: string; severity: string; runIds: string[]; sampleTruncated: boolean } }>;
+};
+export const fetchMonitoring = () => requestJson<MonitoringState>("/api/monitoring");
+export type PruneOperation = { runId: string; args: { key: string; before: string; afterSequence: number; maxRows: number } };
+export type PruneReceipt = { deleted: number; examined: number; examinedThrough: number; deletedIdsHash: string; createdAt: string };
+export const requestOutputPrune = (input: PruneOperation) => requestJson<{ id: string }>("/api/security/approvals", { method: "POST", body: JSON.stringify({ ...input, tool: "telemetry_prune" }) });
+export async function approveOutputPrune(input: PruneOperation & { approvalId: string }) {
+  await requestJson(`/api/security/approvals/${encodeURIComponent(input.approvalId)}/approve`, { method: "POST", body: "{}" });
+  return requestJson<PruneReceipt>("/api/tools/execute", { method: "POST", body: JSON.stringify({ ...input, tool: "telemetry_prune" }) });
+}
 export async function approveMemoryClear(input: { runId: string; approvalId: string }) {
   await requestJson(`/api/security/approvals/${encodeURIComponent(input.approvalId)}/approve`, { method: "POST", body: "{}" });
   return requestJson("/api/memory", { method: "DELETE", body: JSON.stringify(input) });

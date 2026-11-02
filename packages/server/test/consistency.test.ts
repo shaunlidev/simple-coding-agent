@@ -48,7 +48,7 @@ test("R3.3 concurrent and post-restart retries preserve a single receipt; change
 test("R3 readiness and snapshot do not start background demo work", async () => {
   const { app, database, request, runtime } = await createAuthenticatedServer();
   try {
-    assert.equal((await request({ url: "/readyz" })).statusCode, 200);
+    assert.equal((await request({ url: "/readyz" })).statusCode, 503);
     assert.equal((await request({ url: "/api/snapshot" })).statusCode, 200);
     assert.deepEqual(await runtime.listRuns(), []);
     assert.deepEqual(await runtime.readSchedules(), []);

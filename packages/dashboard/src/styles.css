@@ -45,6 +45,26 @@ button:disabled {
 .taskSelector, .taskConfig label { display: grid; gap: 6px; min-width: 0; font-size: 14px; }
 .taskSelector select, .taskConfig input, .taskConfig textarea, .taskConfig select { width: 100%; min-width: 0; padding: 10px; border: 1px solid #64736a; border-radius: 4px; background: white; color: #17211d; }
 .taskConfig { padding: 16px 0; border-bottom: 1px solid #ced8cf; }
+.monitoringBand { padding: 16px 0; margin-bottom: 18px; border-block: 1px solid #cbd2dc; letter-spacing: 0; }
+.monitoringBand > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.monitoringBand h2 { font-size: 18px; margin: 0; }
+.monitorReadings { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)) minmax(170px, 1.5fr); gap: 16px; }
+.monitorReadings > div { min-width: 0; }
+.monitorReadings dt { font-size: 13px; color: #516073; margin-bottom: 6px; }
+.monitorReadings dd { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
+.monitorGood { color: #165469; }
+.monitorBad { color: #9a3327; }
+.monitorReasons { color: #9a3327; font-size: 14px; overflow-wrap: anywhere; }
+.monitorAlerts summary, .outputRetention summary { padding: 8px 0; cursor: pointer; font-size: 14px; }
+.monitorAlerts ol { list-style: none; padding: 0; margin: 0; }
+.monitorAlerts li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 16px; padding: 10px 0; border-top: 1px solid #cbd2dc; font-size: 14px; overflow-wrap: anywhere; }
+.monitorAlerts small { grid-column: 1 / -1; color: #516073; }
+.retentionForm { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 12px; align-items: end; margin: 12px 0; }
+.retentionForm label { display: grid; gap: 6px; min-width: 0; font-size: 14px; }
+.retentionForm input { width: 100%; min-width: 0; padding: 8px; border: 1px solid #64736a; border-radius: 4px; background: white; }
+.retentionApproval, .outputRetention p { font-size: 14px; overflow-wrap: anywhere; }
+@media (max-width: 800px) { .monitorReadings { grid-template-columns: repeat(3, minmax(0, 1fr)); } .retentionForm { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .monitorReadings { grid-template-columns: repeat(2, minmax(0, 1fr)); } .monitorAlerts li, .retentionForm { grid-template-columns: minmax(0, 1fr); } }
 .taskConfig > button { min-height: 40px; padding: 8px 16px; border: 1px solid #64736a; border-radius: 4px; color: #17211d; background: white; }
 .taskConfig form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 16px; padding: 16px 0; }
 .taskConfig p { overflow-wrap: anywhere; color: #7d211f; }
@@ -507,7 +527,9 @@ meter {
     flex-direction: column;
   }
 }
-.runHistory { display: grid; gap: 8px; min-width: 0; }
+.runHistory { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; min-width: 0; }
+.runHistory > div { min-width: 0; }
+.runHistory p { overflow-wrap: anywhere; }
 .runHistory select { width: 100%; min-width: 0; padding: 8px; font: inherit; }
 .runIdentity { overflow-wrap: anywhere; font-family: monospace; }
 

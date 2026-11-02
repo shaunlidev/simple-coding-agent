@@ -21,8 +21,16 @@ export const envSchema = z.object({
   AGENT_TRUST_PROXY: z.enum(["0", "1"]).default("0"),
   AGENT_DEMO_MODE: z.enum(["0", "1"]).default("0"),
   AGENT_DNS_MODE: z.enum(["system", "cloudflare"]).default("system"),
+  AGENT_PRICE_CATALOG: z.string().max(100_000).default("[]"),
+  AGENT_HEARTBEAT_MS: z.coerce.number().int().min(1).max(86_400_000).default(30_000),
+  AGENT_HEARTBEAT_STALE_MS: z.coerce.number().int().min(1).max(86_400_000).default(90_000),
+  AGENT_MONITOR_POLL_MS: z.coerce.number().int().min(1).max(86_400_000).default(5_000),
+  AGENT_MONITOR_OVERDUE_MS: z.coerce.number().int().min(1).max(86_400_000).default(15_000),
   NODE_ENV: z.string().optional(),
 }).superRefine((env, context) => {
+  if (!(env.AGENT_HEARTBEAT_MS < env.AGENT_HEARTBEAT_STALE_MS && env.AGENT_MONITOR_POLL_MS < env.AGENT_MONITOR_OVERDUE_MS && env.AGENT_MONITOR_OVERDUE_MS < env.AGENT_HEARTBEAT_STALE_MS)) {
+    context.addIssue({ code: "custom", path: ["AGENT_HEARTBEAT_STALE_MS"], message: "Require heartbeat < stale and monitor poll < overdue < stale" });
+  }
   const requiresSecrets = env.AGENT_REQUIRE_PRODUCTION_SECRETS === "1" || env.AGENT_REQUIRE_PRODUCTION_SECRETS === "true" || env.NODE_ENV === "production";
   if (requiresSecrets && !env.DEEPSEEK_API_KEY) {
     context.addIssue({

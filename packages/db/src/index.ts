@@ -304,6 +304,15 @@ const localImportSchema = [
   "create table legacy_task_imports (source_key text primary key, manifest_hash text not null, receipt_json text not null, actor text not null, created_at text not null)",
 ];
 
+const monitoringSchema = [
+  "create table worker_monitor_state (id text primary key check(id in ('worker','poll')), session text not null, sequence integer not null, observed_at text not null, payload_json text not null)",
+  "create table worker_alert_state (condition text primary key, generation integer not null, active integer not null check(active in (0,1)))",
+  "create table worker_alert_transitions (sequence integer primary key autoincrement, condition text not null, generation integer not null, edge text not null check(edge in ('open','recovery')), observed_at text not null, evidence_json text not null, unique(condition,generation,edge))",
+  "create table runtime_prunes (actor text not null, request_key text not null, intent_hash text not null, receipt_json text not null, created_at text not null, primary key(actor,request_key))",
+  "create index runtime_failed_window on runtime_events(timestamp, sequence) where type = 'run.failed'",
+  "create index runtime_delta_sequence on runtime_events(sequence) where type = 'agent.output.delta'",
+];
+
 export function migrateSqliteDatabase(database: SqliteDatabase): void {
   const { sqlite } = database;
   const migrations = [
@@ -330,6 +339,9 @@ export function migrateSqliteDatabase(database: SqliteDatabase): void {
     } },
     { version: 7, name: "local-task-import-receipts-v1", statements: localImportSchema, apply: () => {
       for (const statement of localImportSchema) sqlite.exec(statement);
+    } },
+    { version: 8, name: "worker-monitoring-v1", statements: monitoringSchema, apply: () => {
+      for (const statement of monitoringSchema) sqlite.exec(statement);
     } },
   ];
   sqlite.transaction(() => {

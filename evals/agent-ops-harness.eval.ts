@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { redactSecrets } from "../packages/security/src/index.ts";
+import { createDeepSeekProvider } from "../packages/ai/src/index.ts";
 import {
   RuntimeScheduler,
   SQLiteRuntimeStore,
   runContentPipeline,
   runDemoAgent,
+  executeContentRun,
   type EvalReportInput,
   type RuntimeEventType,
   type RuntimeEvent,
@@ -152,15 +154,30 @@ test("agent ops harness stores release-gate eval reports with trace evidence", a
     evidence: "security.redactSecrets output",
   });
 
-  const snapshot = await store.snapshot();
-  const budgetPassed = snapshot.metrics.costUsd <= 0.01 && snapshot.metrics.p95LatencyMs <= 5_000;
+  let sends = 0; let aborted = false;
+  const price = { version: "eval-fixture-v1", provider: "deepseek", model: "model", source: "https://example.test/fixture", checkedAt: new Date().toISOString(), validFrom: "2000-01-01T00:00:00.000Z", validUntil: "2100-01-01T00:00:00.000Z", inputMicrousdPerMillion: 1_000_000, cachedInputMicrousdPerMillion: 100_000, outputMicrousdPerMillion: 2_000_000 };
+  const provider = createDeepSeekProvider({ apiKey: "fixture", model: "model", fetch: async (_url, init) => {
+    sends++;
+    return new Promise<Response>((_resolve, reject) => {
+      const abort = () => { aborted = true; reject(new Error("Controlled request aborted")); };
+      if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  } });
+  for (const [id, limits, expected] of [["budget", { maxCostUsd: 0.000000001 }, /cost_budget_preflight/], ["deadline", { runTimeoutMs: 100 }, /deadline|abort/i]] as const) {
+    store.saveContentTask({ id, title: id, instruction: "Collect controlled evidence", model: "model", sources: [{ id: "source", kind: "url", url: "https://example.test/source" }], limits }, 0);
+    const { runId } = store.admitContentRun({ actor: "eval", key: id, taskId: id, trigger: "manual" });
+    await assert.rejects(executeContentRun(store, runId, { providerFactory: () => provider, prices: [price] }), expected);
+    if (id === "budget") assert.equal(sends, 0);
+    assert.equal(store.readRunResult(runId), undefined);
+  }
+  const budgetPassed = sends === 1 && aborted;
   await saveGate(store, {
     id: "cost-latency-budget",
-    name: "Cost and latency stay inside MVD budget",
+    name: "Model preflight and deadline stop actual dispatch",
     status: budgetPassed ? "passed" : "failed",
     score: budgetPassed ? 1 : 0,
-    evidence: "snapshot metrics budget check",
-    evidenceData: { runId: snapshot.latestRun?.id, costUsd: snapshot.metrics.costUsd, p95LatencyMs: snapshot.metrics.p95LatencyMs },
+    evidence: "Controlled provider: zero sends under low budget, one aborted request under deadline; no delivery",
+    evidenceData: { providerSends: sends, transportAborted: aborted, evidenceKind: "controlled-provider" },
   });
 
   const reports = await store.listEvalReports();

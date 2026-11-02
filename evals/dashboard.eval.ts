@@ -60,7 +60,7 @@ test("dashboard vite build contains agent ops cockpit and runtime API wiring", a
   assert.equal(builtText.includes("last"), true);
   assert.equal(builtText.includes("Security"), true);
   assert.equal(builtText.includes("Preference diffs"), true);
-  assert.equal(builtText.includes("P50 latency"), true);
+  assert.equal(builtText.includes("Run P50"), true);
   assert.equal(builtText.includes("Tool failures"), true);
   assert.equal(builtText.includes("traceId"), true);
   assert.equal(builtText.includes("spanId"), true);

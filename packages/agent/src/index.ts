@@ -6,6 +6,7 @@ import type {
   Provider,
   ProviderContext,
   StreamEvent,
+  StreamOptions,
   ToolCallContent,
   ToolDefinition,
   ToolMessage,
@@ -27,7 +28,17 @@ export type AgentLoopOptions = {
   maxTurns?: number;
   maxToolCalls?: number;
   signal?: AbortSignal;
+  dispatch?: AgentDispatch;
 };
+
+export type AgentDispatch = {
+  model(call: { turn: number; model: Provider["models"][number]; context: ProviderContext }, invoke: (options?: StreamOptions) => Promise<AssistantMessage>): Promise<AssistantMessage>;
+  tool(call: { turn: number; toolCall: ToolCallContent }, invoke: (signal?: AbortSignal) => Promise<ToolMessage>): Promise<ToolMessage>;
+};
+
+function combineSignals(original?: AbortSignal, governed?: AbortSignal) {
+  return original && governed ? AbortSignal.any([original, governed]) : original ?? governed;
+}
 
 export type AgentLoopResult = {
   messages: Message[];
@@ -130,29 +141,30 @@ async function produceAgentLoop(
       tools: options.tools,
     };
 
-    let providerStream;
+    let invoked = false;
+    const invokeModel = async (permit: StreamOptions = {}) => {
+      if (invoked) throw new Error("Model callback already invoked");
+      invoked = true;
+      const signal = combineSignals(options.signal, permit.signal);
+      assertNotAborted(signal);
+      const providerStream = options.provider.stream(model, context, { ...permit, signal });
+      const result = providerStream.result();
+      void result.catch(() => undefined);
+      try {
+        for await (const event of providerStream) stream.push({ type: "provider_event", turn, event });
+        return await result;
+      } catch (error) { await result.catch(() => undefined); throw error; }
+    };
+    let assistant: AssistantMessage;
     try {
-      providerStream = options.provider.stream(model, context, { signal: options.signal });
+      assistant = options.dispatch ? await options.dispatch.model({ turn, model, context }, invokeModel) : await invokeModel();
     } catch (error) {
-      const message = createAgentErrorMessage(error);
+      const message = createAgentErrorMessage(error, options.signal?.aborted || isAbortError(error) ? "aborted" : "error");
       messages.push(message);
       stream.push({ type: "agent_end", messages: cloneMessages(messages) });
       return;
     }
 
-    try {
-      for await (const event of providerStream) {
-        stream.push({ type: "provider_event", turn, event });
-      }
-    } catch (error) {
-      await providerStream.result().catch(() => undefined);
-      const message = createAgentErrorMessage(error, isAbortError(error) ? "aborted" : "error");
-      messages.push(message);
-      stream.push({ type: "agent_end", messages: cloneMessages(messages) });
-      return;
-    }
-
-    const assistant = await providerStream.result();
     messages.push(cloneMessage(assistant));
 
     if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
@@ -184,25 +196,21 @@ async function produceAgentLoop(
 
       stream.push({ type: "tool_start", turn, toolCall });
 
-      let toolMessage: ToolMessage;
-      try {
-        const args = parseToolArguments(tool, JSON.stringify(toolCall.arguments));
-        const result = await tool.execute?.(args, options.signal);
-        toolMessage = {
-          role: "tool",
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          content: normalizeToolResult(result ?? ""),
-        };
-      } catch (error) {
-        toolMessage = {
-          role: "tool",
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          content: error instanceof Error ? error.message : String(error),
-          isError: true,
-        };
-      }
+      let toolInvoked = false;
+      const invokeTool = async (governed?: AbortSignal): Promise<ToolMessage> => {
+        if (toolInvoked) throw new Error("Tool callback already invoked");
+        toolInvoked = true;
+        const signal = combineSignals(options.signal, governed);
+        assertNotAborted(signal);
+        try {
+          const args = parseToolArguments(tool, JSON.stringify(toolCall.arguments));
+          const result = await tool.execute?.(args, signal);
+          return { role: "tool", toolCallId: toolCall.id, toolName: toolCall.name, content: normalizeToolResult(result ?? "") };
+        } catch (error) {
+          return { role: "tool", toolCallId: toolCall.id, toolName: toolCall.name, content: error instanceof Error ? error.message : String(error), isError: true };
+        }
+      };
+      const toolMessage = options.dispatch ? await options.dispatch.tool({ turn, toolCall }, invokeTool) : await invokeTool();
 
       messages.push(toolMessage);
       stream.push({ type: "tool_end", turn, message: cloneMessage(toolMessage) });

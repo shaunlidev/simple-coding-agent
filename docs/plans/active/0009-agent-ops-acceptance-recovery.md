@@ -1,6 +1,6 @@
 # 0009 Agent Ops 验收整改计划
 
-状态：用户已批准持续推进。R1 至 R5 已分别验收并推送 `98501c5`、`f320f97`、`dd6be3b`、`1a5d677`、`6b99dfd`，均已核对远端 SHA。R4 确切提交上的真实 DeepSeek、公开来源和浏览器验收通过。R6 实现、Dashboard 闭环与实际进程重启验收已通过，待独立提交、clean exact-head 复验和推送；R7-R10 待开始。
+状态：用户已批准持续推进。R1 至 R6 已分别验收并推送 `98501c5`、`f320f97`、`dd6be3b`、`1a5d677`、`6b99dfd`、`efa9779`，均已核对远端 SHA。R7 的计量、预算、trace、heartbeat、告警、审批保留策略已完成工作区验收；真实 DeepSeek usage 对照、调用中途 SIGKILL 恢复、桌面/手机及调度/记忆回归通过。冻结代码全量测试 319 项，317 reported pass、2 skipped、0 failed。R7 独立提交、clean exact-head 复验与推送核对待完成；R8-R10 待开始。证据见 `docs/evidence/R7-observability-monitoring.md`。
 
 复核日期：2026-11-01。代码基线：`797ccb8`。
 
@@ -54,8 +54,8 @@
 | R3 | run、内容、投递和事件状态一致 | 2、6 | db、runtime | 验收通过，已推送 |
 | R4 | Dashboard 运行真实 agent 与内容流程 | 3、6 | runtime、server、已有 ai/agent 组合 | 验收通过，已推送 |
 | R5 | 定时、排队、取消和重启恢复正确 | 5 | runtime、server | 验收通过，已推送 `6b99dfd`，远端 SHA 已核对 |
-| R6 | 偏好、检索和实践更新影响后续运行 | 7 | db、runtime、coding-agent、tui、dashboard | 行为、界面和进程验收已通过；待独立提交、clean exact-head 复验和推送，证据见 `docs/evidence/R6-memory-feedback-practices.md` |
-| R7 | 指标、trace 和 heartbeat 来自实际运行 | 9、10 | runtime、server、ai 调用监测 | 待开始 |
+| R6 | 偏好、检索和实践更新影响后续运行 | 7 | db、runtime、coding-agent、tui、dashboard | 验收通过，已推送 `efa9779`，远端 SHA 已核对 |
+| R7 | 指标、trace 和 heartbeat 来自实际运行 | 9、10 | runtime、server、ai 调用监测 | 工作区 AC、live usage、进程/界面及冻结回归通过；独立提交、clean exact-head 与远端核对待完成 |
 | R8 | Dashboard 完成全部用户操作流程 | 4 | dashboard、对应 server API | 待开始 |
 | R9 | harness 能阻止已知坏行为重新上线 | 8 | evals、各包行为测试、CI | 待开始 |
 | R10 | 本地容器与受控云环境通过发布验收 | 10，以及所有 Phase 的最终复核 | Docker、部署配置、发布与证据文档 | 待开始 |

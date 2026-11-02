@@ -14,10 +14,10 @@ test("sqlite runtime projects a complete agent ops snapshot from append-only eve
   assert.equal(store.readRunResult(runId)?.deliveries.length, snapshot.pipeline.delivered);
   assert.equal(snapshot.latestRun?.id, runId);
   assert.equal(snapshot.latestRun?.status, "completed");
-  assert.equal(snapshot.spans.some((span) => span.type === "llm"), true);
+  assert.equal(snapshot.spans.some((span) => span.type === "llm"), false);
   assert.equal(snapshot.steps.some((step) => step.name === "Summarize"), true);
-  assert.equal(snapshot.metrics.evalPassRate, 1);
-  assert.equal(snapshot.security.secretScan, "passed");
+  assert.equal(snapshot.metrics.evalPassRate, null);
+  assert.equal(snapshot.security.secretScan, "not_run");
   store.database.sqlite.close();
 });
 
@@ -68,7 +68,7 @@ test("sqlite runtime persists security audit and tool approvals", async () => {
   await store.recordSecurityAudit({
     action: "browser_type",
     severity: "warning",
-    message: "Tool requires approval",
+    message: JSON.stringify({ decision: "denied", reason: "Tool requires approval" }),
   });
 
   const audit = await store.listSecurityAudit();
@@ -77,7 +77,7 @@ test("sqlite runtime persists security audit and tool approvals", async () => {
 
   assert.equal(audit.length, 1);
   assert.equal(approvals[0]?.status, "denied");
-  assert.equal(snapshot.security.sandbox, "enabled");
+  assert.equal(snapshot.security.sandbox, "not_configured");
   assert.equal(snapshot.security.denials.some((denial) => denial.tool === "browser_type"), true);
   store.database.sqlite.close();
 });
@@ -287,45 +287,23 @@ test("memory guard rejects external and injection-like writes, while trusted kno
   store.database.sqlite.close();
 });
 
-test("observability projects complete OTel-compatible trace and metrics", async () => {
+test("extractive demo never invents model calls, paid usage or production samples", async () => {
   const store = new SQLiteRuntimeStore();
-  const runId = await runDemoAgent(store, { trigger: "manual", delayMs: 0 });
-  const snapshot = await store.snapshot();
-  const spans = snapshot.spans.filter((span) => span.runId === runId);
-  const root = spans.find((span) => span.type === "root");
-  const llm = spans.find((span) => span.type === "llm");
-
-  assert.equal(Boolean(root), true);
-  assert.equal(spans.every((span) => span.traceId === root?.traceId), true);
-  assert.equal(spans.filter((span) => span.type !== "root").every((span) => span.parentSpanId === root?.spanId), true);
-  assert.equal(Boolean(llm?.attributes["llm.model"]), true);
-  assert.equal((llm?.inputTokens ?? 0) > 0, true);
-  assert.equal((llm?.outputTokens ?? 0) > 0, true);
-  assert.equal((llm?.costUsd ?? 0) > 0, true);
-  assert.equal(snapshot.metrics.p50LatencyMs >= 0, true);
-  assert.equal(snapshot.metrics.p95LatencyMs >= snapshot.metrics.p50LatencyMs, true);
-  assert.equal(snapshot.metrics.inputTokens, snapshot.latestRun?.inputTokens);
-  assert.equal(snapshot.metrics.outputTokens, snapshot.latestRun?.outputTokens);
-  store.database.sqlite.close();
-});
-
-test("content pipeline budget can stop or degrade a run", async () => {
-  const stopStore = new SQLiteRuntimeStore();
-  await assert.rejects(
-    () => runContentPipeline(stopStore, "run-budget-stop", { budget: { maxCostUsd: 0.0001, onOverflow: "throw" } }),
-    /Budget overflow/,
-  );
-  const stopEvents = await stopStore.listEvents("run-budget-stop");
-  assert.equal(stopEvents.some((event) => event.type === "run.failed" && event.severity === "error"), true);
-  stopStore.database.sqlite.close();
-
-  const degradeStore = new SQLiteRuntimeStore();
-  const delivered = await runContentPipeline(degradeStore, "run-budget-degrade", { budget: { maxCostUsd: 0.0001, onOverflow: "degrade" } });
-  const degradeEvents = await degradeStore.listEvents("run-budget-degrade");
-  const summarize = degradeEvents.find((event) => event.type === "pipeline.summarize.completed");
-  assert.equal(delivered.length > 0, true);
-  assert.equal(summarize?.severity, "warning");
-  assert.equal(summarize?.payload.degraded, true);
-  assert.equal(summarize?.payload.costUsd, 0);
-  degradeStore.database.sqlite.close();
+  try {
+    const runId = await runDemoAgent(store, { trigger: "manual", delayMs: 0 });
+    const snapshot = await store.snapshot();
+    const root = snapshot.spans.find((span) => span.type === "root");
+    assert.ok(root);
+    assert.match(root.traceId, /^[0-9a-f]{32}$/);
+    assert.match(root.spanId, /^[0-9a-f]{16}$/);
+    assert.equal(snapshot.spans.some((span) => span.type === "llm"), false);
+    assert.equal(snapshot.latestRun?.accounting.costStatus, "not_applicable");
+    assert.equal(snapshot.latestRun?.costUsd, null);
+    assert.equal(snapshot.latestRun?.inputTokens, null);
+    assert.equal(snapshot.metrics.runLatency.samples, 0);
+    assert.equal(snapshot.metrics.runLatency.p95Ms, null);
+    const events = await store.listEvents(runId);
+    assert.equal(events.some((event) => "costUsd" in event.payload || "inputTokens" in event.payload || "outputTokens" in event.payload), false);
+    assert.equal(events.find((event) => event.type === "pipeline.summarize.completed")?.payload.method, "extractive");
+  } finally { store.database.sqlite.close(); }
 });
